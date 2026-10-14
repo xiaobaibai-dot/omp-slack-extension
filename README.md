@@ -1,5 +1,7 @@
 # OMP Slack Extension
 
+English | [简体中文](README.zh-CN.md)
+
 Default-off Slack Socket Mode integration for oh-my-pi 18.10.4. Prototype: cloud mock tests pass; real Slack and Windows integration remain unverified.
 
 ## Behavior
@@ -50,7 +52,7 @@ Default remote tools: origin-bound `slack_reply`, `slack_read_thread`, `slack_up
 
 - File uploads require `files:write` and `OMP_SLACK_UPLOAD_ROOT` set to a dedicated output directory. Only explicit artifact requests should use it. Relative paths, 10 MiB limit, hidden-path/traversal/symlink checks apply; no content secret scanner is guaranteed.
 - Local conversation enumeration requires the corresponding `channels:read`, `groups:read`, `im:read` scopes. Add only what you need and reauthorize the app.
-- Slack limits bot tokens for `conversations.replies` in public/private channel threads. The same-route in-memory history works independently; do not grant a broad user token as an automatic workaround. DM thread reading depends on `im:history`. Confirm current Slack restrictions before extending historical channel access.
+- The minimum manifest includes `im:history`, but no public/private channel history scopes. Current [Slack `conversations.replies` documentation](https://docs.slack.dev/reference/methods/conversations.replies/) lists `channels:history`, `groups:history` and `im:history` for bot tokens; actual access depends on scopes, conversation visibility and API restrictions. Live channel-history access remains unverified. Same-route in-memory history works independently; check current rules before extending access, and do not automatically substitute a broader user token.
 - Optional `OMP_SLACK_LOCAL_TOOLS` is a comma-separated subset of `read,grep,glob,write,edit,bash`. Enabling them exposes the host filesystem/process privileges to allowlisted remote users. They inherit host settings/policy; interactive approvals are unavailable remotely. Test policy behavior before enabling writes or shell. This is NOT an OS sandbox.
 
 Run only ONE active Socket Mode listener per Slack app across all terminals/machines. Slack can distribute events across simultaneous connections. The extension does not enforce a distributed lock.
