@@ -26,6 +26,7 @@ export interface Job {
   readonly text: string;
   readonly ts: string;
   readonly files?: readonly {id: string; name?: string}[];
+  readonly delivery?: "followUp" | "steer";
 }
 export interface ThreadPage {
   messages: { user: string; text: string; ts: string }[];
@@ -52,7 +53,19 @@ export interface Capabilities {
 }
 export type Runner = (job: Job, capabilities: Capabilities, signal: AbortSignal) => Promise<string>;
 export interface Host {
-  canRun(): boolean;
   notify(message: string, level?: "info" | "warning" | "error"): void;
   log?(entry: import("./request-lifecycle.ts").RequestLog): void;
+  status?(route?: Route): NativeStatus;
+  onStopped?(): void | Promise<void>;
+}
+export interface NativeStatus {
+  streaming: boolean;
+  submitting: number;
+  followUp: number;
+  steering: number;
+  consumed: number;
+  claimed: number;
+  activeToolCalls: number;
+  lastEvent?: string;
+  lastObservedAt?: string;
 }

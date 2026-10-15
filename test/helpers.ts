@@ -25,7 +25,7 @@ export class FakeTransport implements Transport {
   async list() { return {conversations:[{id:"CPRIVATE",name:"private name",isPrivate:true,isIm:false}]}; }
 }
 export function host(): Host & {idle:boolean; notifications:string[]; logs:RequestLog[]} {
-  return {idle:true,notifications:[],logs:[],canRun(){return this.idle;},notify(message){this.notifications.push(message);},log(entry){this.logs.push(entry);}};
+  return {idle:true,notifications:[],logs:[],notify(message){this.notifications.push(message);},log(entry){this.logs.push(entry);}};
 }
 export function deferred<T>() { return Promise.withResolvers<T>(); }
 export async function settle() { for (let i=0;i<5;i++) await new Promise<void>(resolve=>setImmediate(resolve)); }

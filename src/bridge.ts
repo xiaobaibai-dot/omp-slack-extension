@@ -4,6 +4,7 @@ import path from "node:path";
 import {createHash, randomUUID} from "node:crypto";
 import {failureReason, requestError} from "./request-lifecycle.ts";
 import type {CancellationReason, RequestLog, RequestReason} from "./request-lifecycle.ts";
+import {messageMode} from "./message-mode.ts";
 import type { Capabilities, Config, Host, Job, Transport } from "./types.ts";
 export interface HistoryTurn { request: string; reply: string }
 export interface RunInput { job: Job; history: readonly HistoryTurn[]; requestId?: string }
@@ -21,10 +22,11 @@ export class SlackBridge {
   #generation = 0;
   #transport?: Transport;
   #botUserId = "";
-  #queue: Job[] = [];
-  #dedupe = new Map<string, number>();
+  // These are request records, not an execution queue. OMP owns all scheduling.
+  #requests = new Map<string, {job: Job; controller: AbortController}>();
+  #controls = new Set<AbortController>();
+  readonly #dedupe: Map<string, number>;
   #history = new Map<string, HistoryTurn[]>();
-  #active?: { job: Job; controller: AbortController };
   #startedAt = 0;
   #stopping?: Promise<void>;
   readonly config: Config;
@@ -32,12 +34,16 @@ export class SlackBridge {
   readonly makeTransport: () => Transport;
   readonly run: IsolatedRunner;
   readonly clock: TaskClock;
-  constructor(config: Config, host: Host, makeTransport: () => Transport, run: IsolatedRunner, clock: TaskClock = taskClock) {
+  constructor(config: Config, host: Host, makeTransport: () => Transport, run: IsolatedRunner, clock: TaskClock = taskClock, eventDedupe = new Map<string, number>()) {
     this.config = config; this.host = host; this.makeTransport = makeTransport; this.run = run;
     this.clock = clock;
+    this.#dedupe = eventDedupe;
   }
   get state(): State { return this.#state; }
-  status() { return {state: this.#state, queued: this.#queue.length, busy: Boolean(this.#active), historyRoutes: this.#history.size}; }
+  status() {
+    const native = this.host.status?.();
+    return {state: this.#state, pending: this.#requests.size, busy: this.#requests.size > 0, historyRoutes: this.#history.size, native};
+  }
   async start(): Promise<void> {
     if (this.#state !== "off") return;
     if (this.#transport) throw new Error("Close the previous Slack connection before starting again.");
@@ -51,7 +57,7 @@ export class SlackBridge {
       const identity = await transport.start(body => this.accept(body, generation), error => {
         if (generation !== this.#generation || this.#state === "off") return;
         void this.stop("transport_disconnected").catch(() => {});
-        this.host.notify(`Slack disconnected (${safeError(error)}). Requests were cancelled; run /slack to reconnect.`, "warning");
+        this.host.notify(`Slack disconnected (${safeError(error)}). Reply routes were revoked; already admitted native work may continue. Run /slack to reconnect.`, "warning");
       });
       if (generation !== this.#generation || this.#state !== "starting") { await this.stop(); return; }
       if (identity.teamId !== this.config.teamId || !identity.botUserId) throw new Error("Slack bot workspace does not match configured workspace.");
@@ -69,12 +75,15 @@ export class SlackBridge {
     // Close admission and invalidate every capability BEFORE any await.
     this.#state = "off";
     ++this.#generation;
-    this.#queue = [];
+    for (const request of this.#requests.values()) request.controller.abort(requestError(reason));
+    this.#requests.clear();
+    for (const controller of this.#controls) controller.abort(requestError(reason));
+    this.#controls.clear();
     this.#history.clear();
-    this.#active?.controller.abort(requestError(reason));
     const transport = this.#transport;
     const stopped = Promise.resolve().then(() => transport?.stop()).then(() => {
       if (this.#transport === transport) this.#transport = undefined;
+      return this.host.onStopped?.();
     });
     const pending = stopped.finally(() => {if (this.#stopping === pending) this.#stopping = undefined;});
     this.#stopping = pending;
@@ -92,23 +101,36 @@ export class SlackBridge {
     if (this.#dedupe.has(key)) return;
     this.#dedupe.set(key, now);
     while (this.#dedupe.size > 2048) this.#dedupe.delete(this.#dedupe.keys().next().value!);
-    if (this.#queue.length >= this.config.maxQueue) {
-      this.host.notify("Slack queue is full; a new request was dropped. Ask the owner to resend later.", "warning");
+    const mode = messageMode(job);
+    if (mode.kind !== "request") {void this.#control(job, mode.kind, generation);return;}
+    if (this.#requests.size >= this.config.maxQueue) {
+      this.host.notify("Slack outstanding-request bound reached; a new request was not submitted to OMP.", "warning");
       return;
     }
-    this.#queue.push(job);
-    void this.tick();
-  }
-  async tick(): Promise<void> {
-    if (this.#state !== "on" || this.#active || !this.#queue.length || !this.host.canRun()) return;
     const transport = this.#transport;
-    if (!transport) return;
-    if (transport.isReady?.() === false) return;
-    const job = this.#queue.shift()!;
-    const generation = this.#generation;
-    const controller = new AbortController();
-    this.#active = {job, controller};
-    const requestId = randomUUID();
+    if (!transport || transport.isReady?.() === false) {
+      this.host.notify("Slack is reconnecting; request was not submitted. No automatic retry.", "warning");return;
+    }
+    const requestId = randomUUID(), controller = new AbortController();
+    this.#requests.set(requestId, {job: mode.job, controller});
+    void this.#dispatch(mode.job, requestId, controller, transport, generation);
+  }
+  async #control(job: Job, kind: "status" | "usage", generation: number): Promise<void> {
+    // A bounded transport-only lane, never a model prompt or a work queue.
+    const transport = this.#transport;
+    if (!transport || transport.isReady?.() === false || this.#controls.size >= 4) return;
+    const controller = new AbortController();this.#controls.add(controller);
+    try {
+      if (this.#state !== "on" || generation !== this.#generation) return;
+      const status = this.host.status?.(job.route);
+      const text = kind === "usage" ? "Use !insert TEXT / !steer TEXT, !queue TEXT, or !status. Ordinary messages use OMP follow-up." :
+        JSON.stringify({state: this.#state, scope: "your source thread only", defaultDelivery: "followUp", native: status ?? null});
+      await transport.post(job.route, text, controller.signal);
+    } catch (error) {
+      if (!controller.signal.aborted) this.host.notify(`Slack control reply failed (${safeError(error)}). No automatic retry.`, "warning");
+    } finally {this.#controls.delete(controller);}
+  }
+  async #dispatch(job: Job, requestId: string, controller: AbortController, transport: Transport, generation: number): Promise<void> {
     const startedAt = new Date(this.clock.now()).toISOString();
     let reason: RequestReason = "completed";
     const log = (phase: "start" | "end") => {
@@ -129,7 +151,7 @@ export class SlackBridge {
     let uploads = 0;
     const guard = () => {
       controller.signal.throwIfAborted();
-      if (this.#state !== "on" || this.#generation !== generation || this.#active?.job !== job) throw new Error("Slack request is no longer active.");
+      if (this.#state !== "on" || this.#generation !== generation || this.#requests.get(requestId)?.job !== job) throw new Error("Slack request is no longer active.");
       if (!requesterAllowed(this.config, job.route.user, job.route.channel)) throw new Error("Request sender is no longer authorized.");
     };
     const capabilities: Capabilities = {
@@ -211,8 +233,7 @@ export class SlackBridge {
       }
     } finally {
       log("end");
-      if (this.#active?.job === job) this.#active = undefined;
-      // Tick from the host timer instead of recursive dispatch inside an event callback.
+      if (this.#requests.get(requestId)?.job === job) this.#requests.delete(requestId);
     }
   }
   async listConversations(cursor?: string) {

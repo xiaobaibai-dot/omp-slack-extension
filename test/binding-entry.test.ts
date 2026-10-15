@@ -118,30 +118,38 @@ test("entry retains startup cleanup failures for a later off instead of releasin
   assert.equal(entry.physical.size, 0);await entry.command("on");assert.equal(entry.starts, 2);
 }));
 
-test("entry retains failed disconnect cleanup after its polling timer has stopped", () => withEntry(async entry => {
+test("entry retains failed disconnect cleanup until physical shutdown succeeds", () => withEntry(async entry => {
   await entry.command("on");entry.failStop(true);entry.disconnect();await settle();
-  await new Promise(resolve => setTimeout(resolve, 300));
   assert.equal(entry.leases[0]!.isOwner(), true);assert.equal(entry.physical.size, 1);
   entry.failStop(false);await entry.command("off");assert.equal(entry.physical.size, 0);
   await entry.command("on");assert.equal(entry.starts, 2);
 }));
-test("entry off logs user cancellation and uses the existing main session status", () => withEntry(async entry => {
+test("entry off logs cancellation and warns admitted work may continue without aborting the main session", () => withEntry(async entry => {
   await entry.command("on");entry.beginRequest();await settle();await entry.command("status");
   const status = JSON.parse(entry.notices.findLast(text => text.startsWith('{"state"'))!);
   assert.equal(status.host.streaming, true);assert.equal(status.host.idle, false);
-  await entry.command("off");await settle();assert.equal(entry.main.aborted, 1);
+  await entry.command("off");await settle();assert.equal(entry.main.aborted, 0);
   assert.equal(entry.logs.at(-1)?.reason, "user_cancelled");assert.equal(entry.posts, 0);
+  assert.ok(entry.notices.some(text => text.includes("Already admitted or claimed native work may continue")));
   assert.equal(entry.logs[0]!.requestId, entry.logs[1]!.requestId);
 }));
 test("entry session shutdown logs session cancellation without clearing the transcript", () => withEntry(async entry => {
   await entry.command("on");entry.beginRequest();await settle();
   await entry.lifecycleEvent("session_shutdown");await settle();
-  assert.equal(entry.logs.at(-1)?.reason, "session_cancelled");assert.equal(entry.main.aborted, 1);
+  assert.equal(entry.logs.at(-1)?.reason, "session_cancelled");assert.equal(entry.main.aborted, 0);
   assert.equal(entry.main.messages.length, 1);assert.equal(entry.posts, 0);
 }));
-test("entry IPC takeover cancels and logs the old main turn before replacement ownership", () => withEntry(async entry => {
+test("entry IPC takeover revokes old reply permission without aborting the main turn", () => withEntry(async entry => {
   await entry.command("on");entry.beginRequest();await settle();const next = await entry.claim();
   try {await settle();assert.equal(next.isOwner(), true);assert.equal(entry.physical.size, 0);
-    assert.equal(entry.main.aborted, 1);assert.equal(entry.logs.at(-1)?.reason, "binding_taken_over");assert.equal(entry.posts, 0);}
+    assert.equal(entry.main.aborted, 0);assert.equal(entry.logs.at(-1)?.reason, "binding_taken_over");assert.equal(entry.posts, 0);}
   finally {await next.release();}
+}));
+
+test("entry off/on retains event deduplication across newly constructed bridges", () => withEntry(async entry => {
+  await entry.command("on");entry.beginRequest();await settle();
+  assert.equal(entry.main.messages.length, 1);
+  await entry.command("off");await entry.command("on");entry.beginRequest();await settle();
+  assert.equal(entry.starts, 2);assert.equal(entry.main.messages.length, 1);
+  assert.equal(entry.main.aborted, 0);assert.equal(entry.posts, 0);
 }));

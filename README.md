@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 For OMP 18.10.4. `/slack` manually binds Slack to the currently open main conversation. Requests and replies appear in that same transcript and use its existing context, model, tools and approvals. Startup, restart and session changes default to off; closing the conversation disconnects.
 
-The shared mode still needs live Slack acceptance. A real Windows OMP SDK probe verified exact main-session identity and shared context. Earlier successful DM feedback concerned the old isolated worker implementation. See [Windows acceptance](docs/windows-acceptance.md).
+The native-channel revision is cloud-tested only and has not been deployed to Windows or exercised against live Slack/model traffic. Earlier main-session probes and Slack results do not validate this revision. See [native-channel design](docs/native-channels.md) and [Windows acceptance](docs/windows-acceptance.md).
 
 ## Install
 
@@ -20,13 +20,25 @@ For automatic loading, place the entry, sources and production dependencies unde
 | Command | Behavior |
 | --- | --- |
 | `/slack`, `/slack on` | Bind the current main conversation and connect |
-| `/slack off` | Disconnect and cancel pending Slack work; preserve the main transcript |
+| `/slack off` | Stop admission and replies; withdraw still-editable Slack queue items, without aborting the main session |
 | `/slack status` | Connection, queue and busy status |
 | `/slack channels` | Local conversation directory; requires the corresponding read scopes |
 
-Requests wait FIFO while the host is busy; they never steer local input. Event IDs are deduplicated. Switching, branching or navigating the session tree disconnects and requires manual binding again.
+### Slack message delivery
 
-For the same OS user, workspace and App on one machine, a new OMP conversation's `/slack` takes over the existing binding. It first stops old admission, cancels that conversation's Slack work and closes its socket, then connects the new owner. It preserves the old OMP process and transcript. Repeated enable in the same conversation keeps the current connection. Windows uses an exclusive named pipe only while enabled: no permanent service or persistent lock file. OS cleanup permits recovery after a process crash. A stalled previous owner cannot be bypassed while its shutdown is unconfirmed.
+| Slack message body (after the channel @mention) | Native behavior |
+| --- | --- |
+| Ordinary text, or `!queue TEXT` | `followUp`, the default native queue |
+| `!insert TEXT` or `!steer TEXT` | Native `steer`, for intervention at OMP's supported interruption boundary |
+| `!status` | Transport-only status, bypassing the model and work queue |
+
+These prefixes are message text, not Slack slash commands. They use the same existing sender/channel authorization, including approved member/bot channels. There is no owner-only restriction on insertion. Event IDs are deduplicated before dispatch or control replies. An empty delivery command returns usage without invoking a model.
+
+The plugin calls OMP `prompt` with the selected `streamingBehavior`: idle input starts normally, busy input enters OMP's own queue immediately. It does not wait for the previous Slack task or host to become idle. Only prompt admission is serialized to preserve submission order. Native one-at-a-time mode provides FIFO follow-ups; existing OMP batch/steering settings remain in effect. Insertion can overtake queued follow-ups. The plugin never changes those settings or calls main-session `abort`.
+
+OMP's native steering can interrupt pure waits and can cooperatively background supported shell work. It does not promise immediate insertion into every tool. This is not permission to terminate a training process; custom tools can have their own steering behavior. Switching, branching or navigating the session tree disconnects and requires manual binding again.
+
+For the same OS user, workspace and App on one machine, a new OMP conversation's `/slack` takes over the existing binding. It first stops old admission, withdraws still-editable Slack input, revokes old replies and closes its socket, then connects the new owner. Already admitted or claimed work may continue in the old conversation. It preserves the old OMP process and transcript. Repeated enable in the same conversation keeps the current connection. Windows uses an exclusive named pipe only while enabled: no permanent service or persistent lock file. OS cleanup permits recovery after a process crash. A stalled previous owner cannot be bypassed while its shutdown is unconfirmed.
 
 For the first upgrade, turn the old listener off and load the new extension in relevant OMP processes. Older versions without the handoff protocol cannot transfer ownership. There is no cross-machine exclusion; keep other machines' listeners for this App off.
 
@@ -58,9 +70,11 @@ On Windows, the user can run `scripts/Configure-Slack.ps1` once with the non-sec
 
 ## Tools and routing
 
-All existing tools and approvals belong to the bound main session. `OMP_SLACK_LOCAL_TOOLS` no longer changes shared-mode tools. All accepted sources share the main context. Only the active request's final answer returns to its source thread; unrelated terminal answers are not broadcast.
+All existing tools and approvals belong to the bound main session. `OMP_SLACK_LOCAL_TOOLS` no longer changes shared-mode tools. All accepted sources share the main context: this is NOT channel/thread context isolation or a filesystem sandbox. Only grant access to people/agents trusted with that context and the host's tool privileges. Reply-route checks prevent accidental destination reassignment, not semantic disclosure by a model with shared context.
 
-After `slack_reply` successfully sends the requested body, the bridge does not send another final explanation. Without an explicit reply, the final answer is sent automatically. Canonical `<@USER_ID>` syntax renders a real user mention.
+Every submitted prompt has a generated `request_id` and immutable source route. Admission does not grant tools: the exact native `message_start` consumption must first be observed. All Slack tools accept optional `request_id`. For a single unambiguous consumed request it may be omitted; for insertion into ongoing local/Slack work or native batched inputs, use each consumed request's explicit ID. Queued/retired IDs are rejected. A reply cannot specify a different channel or thread.
+
+After `slack_reply` successfully sends the requested body, the bridge does not send another final explanation for that request. A successful final answer is automatically forwarded only for a single unambiguous consumed request. Mixed, empty, truncated, error and aborted finals are not broadcast. Replies can finish at native per-turn boundaries while later follow-ups keep running; global idle is not required. Canonical `<@USER_ID>` syntax renders a real user mention.
 
 Additional tools: `slack_reply`, `slack_read_thread`, `slack_upload_file`, `slack_download_file`, `slack_list_conversations`. Host uploads accept absolute paths or paths relative to the bound workspace, without an output-root restriction. Upload must be explicitly requested and follows normal OMP write approval. Current limits are 10 MiB per regular file and three uploads per request. Never upload credentials or unrelated files.
 
@@ -68,16 +82,18 @@ Downloads require `files:read` and reauthorization. `slack_download_file` takes 
 
 Thread reads require the applicable Slack scopes; minimal scopes do not grant full channel history. Reads are limited to three pages of 15 messages per request. Remote directory results include only the source; the local directory needs extra read scopes.
 
-The queue holds 32 requests. The main-session bridge adds no task wall-clock or idle timeout. Manual cancellation, session close/switch and binding takeover still cancel the corresponding Slack turn. Local user input mixed into an active Slack turn prevents forwarding that mixed final answer. Disconnect cannot recall writes already submitted to Slack.
+The bridge tracks at most 32 outstanding requests; this is an admission bound, not a private execution queue. It adds no task wall-clock or idle timeout. Local input revokes prior remote tool/reply association rather than aborting local work.
+
+**Off/disconnect/takeover is not an execution kill switch.** Admission closes and reply capabilities are revoked immediately. Only the plugin's exact, still-editable native pending messages are removed, from either native lane (including TUI-promoted follow-ups). Already admitted idle preflight, claimed/live-steered or consumed work may continue. No main-session abort occurs and unrelated native queue items are retained. Session switches invalidate old routes; native generation checks and the admission guard prevent stale submission in the new session. A write already sent to Slack cannot be recalled. Turning the listener on again never replays revoked requests.
 
 Network operations have separate limits: Web API attempts time out after 10 seconds; file HTTP attempts after 30 seconds. Reads retry transient connection errors and retryable 5xx with exponential backoff and jitter, at most four attempts within two minutes. A rejected 429 waits at least [Slack's Retry-After](https://docs.slack.dev/apis/web-api/rate-limits). SDK HTTP retries are disabled to avoid nested retry loops. Authentication, permission and argument errors are not retried. Socket Mode keeps its existing bounded connection wait and managed reconnect behavior.
 
-Message sends and file upload phases retry only an explicitly rejected 429. A lost response, timeout or ambiguous 5xx reports `network_outcome_uncertain` and stops the source turn; it never blindly repeats the mutation or automatically sends another final answer. [Upload completion can only be called once](https://docs.slack.dev/reference/methods/files.completeUploadExternal). No additional scopes or unsupported idempotency guarantees are assumed. `No automatic retry` refers to the agent task: HTTP retries do not rerun it.
+Message sends and file upload phases retry only an explicitly rejected 429. A lost response, timeout or ambiguous 5xx reports `network_outcome_uncertain` and revokes that source request’s reply permission; it never blindly repeats the mutation or automatically sends another final answer. [Upload completion can only be called once](https://docs.slack.dev/reference/methods/files.completeUploadExternal). No additional scopes or unsupported idempotency guarantees are assumed. `No automatic retry` refers to the agent task: HTTP retries do not rerun it.
 
-The bound OMP session records `omp_slack_request` custom entries with event ID, generated request ID, source thread/message IDs, start/end timestamps and a fixed outcome reason. Request text, replies, tokens, raw errors and tool content are excluded. `/slack status` reads OMP's own idle, pending-message and streaming state, plus the last observed agent/turn/message/tool event and tool count. These snapshots are diagnostic only; long thinking or tool execution never triggers an idle abort or automatic recovery.
+The bound OMP session records `omp_slack_request` custom entries with event ID, generated request ID, source thread/message IDs, start/end timestamps and a fixed outcome reason. Request text, replies, tokens, raw errors and tool content are excluded. `/slack status` reads OMP's own idle, pending-message and streaming state, plus the last observed agent/turn/message/tool event and tool count. Slack `!status` returns only the caller's source-thread/requester counts, plus global streaming and observed activity counts/timestamps, without prompt text, tool arguments or other channel IDs. It works even at the outstanding-request bound, subject to Slack connectivity/rate limits and a four-control-reply concurrency cap. `claimed` means admitted but not in an editable queue or observed consumed state; it can include preflight or a removed item awaiting settlement. Tool activity is observed since enable, not independent training-process verification. These snapshots are diagnostic only; long thinking or tool execution never triggers an idle abort or automatic recovery.
 
 ## Validation
 
-Run `npm run check` for types and regressions covering routing, channel members, FIFO, duplicates, transport cancellation and reconnect, shared-turn ownership and uploads. Legacy isolated SDK code/tests remain for historical regression; the entry uses the shared runner.
+Run `npm run check` for types and regressions covering native admission/consumption, queue/steer modes, multi-source reply ownership, direct status, existing member/bot authorization, dedupe, late admission/session-switch races, off without main-session abort, transport behavior and files. Legacy isolated SDK code/tests remain for historical regression only; the entry uses `NativeSession`.
 
-Real Windows SDK fixtures verified shared main context with zero network and no paid model requests. Live Slack, non-owner channel members, uploads and existing tool approvals need separate evidence. Mock tests do not establish those outcomes. See [the acceptance checklist](docs/windows-acceptance.md).
+Native-channel tests use public-API protocol fixtures and pinned SDK type/source checks, not a real OMP model loop. Live Slack, native wait/background behavior, Windows, non-owner channel members, files and existing tool approvals need separate evidence. Mock tests do not establish those outcomes. See [the acceptance checklist](docs/windows-acceptance.md).

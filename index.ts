@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { SlackBridge } from "./src/bridge.ts";
 import { readConfig } from "./src/config.ts";
-import { runShared } from "./src/shared-runner.ts";
+import { NativeSession } from "./src/shared-runner.ts";
 import type {HostActivity} from "./src/shared-runner.ts";
 import { SlackTransport } from "./src/slack-transport.ts";
 import { makeSlackTools, stringArgument } from "./src/slack-tools.ts";
@@ -13,26 +13,26 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
   const {AgentRegistry, MAIN_AGENT_ID} = pi.pi;
   // Factory-local: OMP may bind this imported factory again for a fresh session.
   let bridge: SlackBridge | undefined;
+  // Retain the bounded, expiring event ledger across off/on bridge instances.
+  // Factory-local only: no cross-factory or persisted session data.
+  const eventDedupe = new Map<string, number>();
   let context: ExtensionContext | undefined;
-  let timer: NodeJS.Timeout | undefined;
   let lifecycle = 0;
   let binding: LocalBinding | undefined;
   let bindingRequest: AbortController | undefined;
-  let activeCapabilities: import("./src/types.ts").Capabilities | undefined;
-  let ownedTurn = false;
+  let native: NativeSession | undefined;
   let lastActivity: HostActivity | undefined;
-  const capabilities = () => {if (!ownedTurn || !activeCapabilities) throw new Error("No active Slack-owned turn."); return activeCapabilities;};
-  for (const tool of makeSlackTools(pi.zod, {
-    reply: text => capabilities().reply(text), readThread: cursor => capabilities().readThread(cursor),
-    upload: (file, title) => capabilities().upload(file, title), listConversations: () => capabilities().listConversations(),
-    download: async (fileId, target) => {const action = capabilities().download; if (!action) throw new Error("Download unavailable."); return action(fileId, target);},
-  }).filter(tool => tool.name !== "slack_list_conversations")) pi.registerTool(tool);
+  const capabilities = (requestId?: string) => {
+    if (!native) throw new Error("No enabled Slack binding.");
+    return native.capabilities(requestId);
+  };
+  for (const tool of makeSlackTools(pi.zod, capabilities).filter(tool => tool.name !== "slack_list_conversations")) pi.registerTool(tool);
   const stop = async (releaseBinding = true, reason: CancellationReason = "user_cancelled") => {
     ++lifecycle;
     bindingRequest?.abort(); bindingRequest = undefined;
-    if (timer) { clearInterval(timer); timer = undefined; }
     const oldBinding = binding;
-    await bridge?.stop(reason);
+    const oldNative = native;
+    try {await bridge?.stop(reason);} finally {oldNative?.dispose();if (native === oldNative) native = undefined;}
     if (releaseBinding) {
       await oldBinding?.release();
       if (binding === oldBinding) binding = undefined;
@@ -43,10 +43,10 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
     handler: async (args, ctx) => {
       context = ctx;
       const command = args.trim().toLowerCase();
-      if (command === "off") { await stop(); ctx.ui.notify("Slack is off; pending Slack requests were cancelled. Main conversation preserved.", "info"); return; }
+      if (command === "off") { await stop(); ctx.ui.notify("Slack is off. Still-queued Slack messages were withdrawn and replies disabled. Already admitted or claimed native work may continue; the main session was not aborted.", "info"); return; }
       if (command === "status") {
         const session = AgentRegistry.global().get(MAIN_AGENT_ID)?.session;
-        ctx.ui.notify(JSON.stringify({...bridge?.status() ?? {state: "off", queued: 0, busy: false},
+        ctx.ui.notify(JSON.stringify({...bridge?.status() ?? {state: "off", pending: 0, busy: false},
           host: {idle: ctx.isIdle(), pendingMessages: ctx.hasPendingMessages(),
             streaming: session?.sessionManager === ctx.sessionManager ? session.isStreaming : null,
             lastObservedActivity: lastActivity}}), "info");return;
@@ -62,7 +62,6 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
         try {await stop();}
         catch {ctx.ui.notify("The previous Slack connection has not closed. Retry /slack off or /slack.", "error");return;}
       }
-      if (timer) { clearInterval(timer); timer = undefined; }
       const generation = ++lifecycle;
       let candidate: SlackBridge | undefined;
       let candidateBinding: LocalBinding | undefined;
@@ -73,22 +72,24 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
         const mainSession = AgentRegistry.global().get(MAIN_AGENT_ID)?.session;
         if (!mainSession || mainSession.sessionManager !== ctx.sessionManager) throw new Error("This OMP session could not be identified for binding.");
         if (generation !== lifecycle) return;
+        const boundSessionId = mainSession.sessionId;
+        const boundNative = new NativeSession(mainSession,
+          () => generation === lifecycle && context?.sessionManager === mainSession.sessionManager && mainSession.sessionId === boundSessionId,
+          activity => {lastActivity = activity;});
+        native = boundNative;
         candidate = new SlackBridge(config,
-          {canRun: () => Boolean(context?.isIdle() && !context.hasPendingMessages()), notify: (message, level) => context?.ui.notify(message, level ?? "info"),
-            log: entry => {mainSession.sessionManager.appendCustomEntry("omp_slack_request", entry);}},
+          {notify: (message, level) => context?.ui.notify(message, level ?? "info"),
+            status: route => boundNative.snapshot(route),
+            log: entry => {mainSession.sessionManager.appendCustomEntry("omp_slack_request", entry);},
+            onStopped: async () => {
+              boundNative.dispose();if (native === boundNative) native = undefined;
+              if (binding === candidateBinding && candidateBinding?.isOwner()) {
+                await candidateBinding.release();if (binding === candidateBinding) binding = undefined;
+              }
+            }},
           () => new SlackTransport(config),
-          async (input, capabilities, signal) => {
-            const host = context;
-            if (!host) throw new Error("Host session ended.");
-            if (host.sessionManager !== mainSession.sessionManager) throw new Error("Bound OMP session changed.");
-            activeCapabilities = capabilities;
-            host.ui.notify("Slack request started in this main session.", "info");
-            try {
-              const reply = await runShared(mainSession, input, signal, owned => {ownedTurn = owned;}, activity => {lastActivity = activity;});
-              host.ui.notify("Slack request completed in this main session.", "info");
-              return reply;
-            } finally {activeCapabilities = undefined; ownedTurn = false;}
-          });
+          (input, requestCapabilities, signal) => boundNative.run(input, requestCapabilities, signal),
+          undefined, eventDedupe);
         bridge = candidate;
         lastActivity = undefined;
         const request = new AbortController(); bindingRequest = request;
@@ -106,25 +107,6 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
         binding = candidateBinding;
         await candidate.start();
         if (generation !== lifecycle) { await candidate.stop(); await candidateBinding.release(); return; }
-        if (candidate.state === "on") {
-          const enabledBridge = candidate;
-          const enabledTimer = setInterval(() => {
-            if (enabledBridge.state === "off") {
-              clearInterval(enabledTimer);
-              if (timer === enabledTimer) timer = undefined;
-              void enabledBridge.stop().then(async () => {
-                if (binding === candidateBinding) {
-                  await candidateBinding?.release();
-                  if (binding === candidateBinding) binding = undefined;
-                }
-              }).catch(() => {});
-              return;
-            }
-            void enabledBridge.tick().catch(() => ctx.ui.notify("Slack queue processing failed.", "warning"));
-          }, 250);
-          timer = enabledTimer;
-          enabledTimer.unref?.();
-        }
       } catch (error) {
         let closed = true;
         try {await candidate?.stop();} catch {closed = false;}
@@ -143,10 +125,10 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
   // Local terminal-only directory tool; never handed to remote workers.
   pi.registerTool({name: "slack_list_conversations", label: "List bot-accessible Slack conversations", loadMode: "essential", approval: "read",
     description: "List at most 100 conversations accessible to the enabled Slack bot. Local terminal only. Optional cursor for the next page; do not publish private names into a channel.",
-    parameters: pi.zod.object({cursor: pi.zod.string().optional()}),
+    parameters: pi.zod.object({request_id: pi.zod.string().optional(), cursor: pi.zod.string().optional()}),
     async execute(_id, params) {
       if (!bridge) throw new Error("Run /slack first.");
-      const page = activeCapabilities ? await capabilities().listConversations() : await bridge.listConversations(stringArgument(params, "cursor", true));
+      const page = !native?.localTurn ? await capabilities(stringArgument(params, "request_id", true)).listConversations() : await bridge.listConversations(stringArgument(params, "cursor", true));
       return {content: [{type: "text", text: JSON.stringify(page)}], details: {}};
     }});
   pi.on("session_start", (_event, ctx) => { context = ctx; });

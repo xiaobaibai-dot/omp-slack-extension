@@ -11,25 +11,25 @@ test("default off and unauthorized events cannot create a worker or post",async(
   await bridge.start(); bridge.accept(envelope("Ev2","C111","rm -rf","UOTHER")); await settle();
   assert.equal(runs,0); assert.equal(transport.posts.length,0); await bridge.stop();
 });
-test("host busy queues without steering; FIFO keeps two channel and DM destinations",async()=>{
-  const h=host();h.idle=false;const transport=new FakeTransport(); const gate=deferred<void>();const order:string[]=[];
-  const bridge=new SlackBridge(config(),h,()=>transport,async({job})=>{order.push(job.route.channel); if(order.length===1)await gate.promise; return job.route.channel;});
-  await bridge.start(); bridge.accept(envelope("Ev1","C111"));bridge.accept(envelope("Ev2","G222"));bridge.accept(envelope("Ev3","D333"));
-  assert.deepEqual(order,[]);h.idle=true;void bridge.tick();await settle();assert.deepEqual(order,["C111"]);
-  await bridge.tick();assert.equal(order.length,1);gate.resolve();await settle();await bridge.tick();await bridge.tick();
-  assert.deepEqual(order,["C111","G222","D333"]);assert.deepEqual(transport.posts.map(p=>p.route.channel),order); await bridge.stop();
+test("busy host submits every request to the native runner without an external execution queue",async()=>{
+  const h=host();h.idle=false;const t=new FakeTransport();const gates=[deferred<void>(),deferred<void>(),deferred<void>()];
+  const order:string[]=[];const b=new SlackBridge(config(),h,()=>t,async({job})=>{const i=order.length;order.push(job.route.channel);await gates[i]!.promise;return job.route.channel;});
+  await b.start();b.accept(envelope("Ev1","C111"));b.accept(envelope("Ev2","G222"));b.accept(envelope("Ev3","D333"));await settle();
+  assert.deepEqual(order,["C111","G222","D333"]);assert.equal(b.status().pending,3);
+  gates[2]!.resolve();gates[0]!.resolve();gates[1]!.resolve();await settle();
+  assert.deepEqual(t.posts.map(post=>[post.route.channel,post.text]),[["D333","D333"],["C111","C111"],["G222","G222"]]);await b.stop();
 });
-test("duplicates are suppressed; queue bound drops excess without running",async()=>{
-  const h=host();h.idle=false;const t=new FakeTransport();let runs=0;
-  const b=new SlackBridge(config({maxQueue:1}),h,()=>t,async()=>{runs++;return "ok";});
-  await b.start();b.accept(envelope());b.accept(envelope());b.accept(envelope("Ev2"));
-  assert.equal(b.status().queued,1);h.idle=true;await b.tick();assert.equal(runs,1);assert.equal(t.posts.length,1);await b.stop();
+test("duplicates and outstanding admission bound do not create extra native submissions",async()=>{
+  const t=new FakeTransport(),gate=deferred<void>();let runs=0;
+  const b=new SlackBridge(config({maxQueue:1}),host(),()=>t,async()=>{runs++;await gate.promise;return "ok";});
+  await b.start();b.accept(envelope());b.accept(envelope());b.accept(envelope("Ev2"));await settle();
+  assert.equal(b.status().pending,1);assert.equal(runs,1);gate.resolve();await settle();assert.equal(t.posts.length,1);await b.stop();
 });
-test("off aborts active work, clears queue, invalidates held tools and suppresses late results",async()=>{
+test("off revokes request signals and held tools and suppresses late results",async()=>{
   const t=new FakeTransport();const gate=deferred<void>();let caps:Capabilities|undefined;let signal:AbortSignal|undefined;
   const b=new SlackBridge(config(),host(),()=>t,async(_input,c,s)=>{caps=c;signal=s;await gate.promise;return "late secret";});
   await b.start();b.accept(envelope());b.accept(envelope("Ev2"));await settle();await b.stop();
-  assert.equal(signal?.aborted,true);assert.equal(b.status().queued,0);await assert.rejects(caps!.reply("late"));
+  assert.equal(signal?.aborted,true);assert.equal(b.status().pending,0);await assert.rejects(caps!.reply("late"));
   gate.resolve();await settle();assert.equal(t.posts.length,0);assert.equal(t.stops,1);
 });
 test("off while starting never enables or dispatches the late socket",async()=>{
@@ -82,7 +82,7 @@ test("origin-bound tools cannot enumerate unrelated private channels and cap thr
 });
 test("uncertain Slack post is never automatically retried",async()=>{
   const t=new FakeTransport();t.post=async(route,text)=>{t.posts.push({route,text});throw new Error("network lost after send");};
-  const b=new SlackBridge(config(),host(),()=>t,async()=>"answer");await b.start();b.accept(envelope());await settle();await b.tick();b.accept(envelope());await settle();assert.equal(t.posts.length,1);await b.stop();
+  const b=new SlackBridge(config(),host(),()=>t,async()=>"answer");await b.start();b.accept(envelope());await settle();b.accept(envelope());await settle();assert.equal(t.posts.length,1);await b.stop();
 });
 test("stale callback from prior enable cannot enqueue after re-enable",async()=>{
   const transports:FakeTransport[]=[];const b=new SlackBridge(config(),host(),()=>{const t=new FakeTransport();transports.push(t);return t;},async()=>"answer");

@@ -1,7 +1,7 @@
 export type CancellationReason = "task_timeout" | "user_cancelled" | "session_cancelled" | "binding_taken_over" | "transport_disconnected";
-export type FailureReason = CancellationReason | import("./network.ts").NetworkCode | "operation_failed";
+export type FailureReason = CancellationReason | import("./network.ts").NetworkCode | "operation_failed" | "reply_ambiguous";
 export type RequestReason = FailureReason | "completed";
-const failures = new Set<string>(["task_timeout", "user_cancelled", "session_cancelled", "binding_taken_over", "transport_disconnected", "network_timeout", "network_retry_exhausted", "network_outcome_uncertain", "network_failed", "operation_failed"]);
+const failures = new Set<string>(["task_timeout", "user_cancelled", "session_cancelled", "binding_taken_over", "transport_disconnected", "network_timeout", "network_retry_exhausted", "network_outcome_uncertain", "network_failed", "operation_failed", "reply_ambiguous"]);
 function cancellationCode(error: unknown): FailureReason | undefined {
   const code = error && typeof error === "object" ? (error as {code?: unknown}).code : undefined;
   return typeof code === "string" && failures.has(code) ? code as FailureReason : undefined;
