@@ -6,8 +6,9 @@ import { deferred,job,settle } from "./helpers.ts";
 const target={ok:true,upload_url:"https://files.slack.com/upload/v1/FAKE",file_id:"F123"};
 test("file completion preserves source channel/thread",async()=>{
   let complete:unknown;const api:UploadApi={getURL:async()=>target,complete:async a=>{complete=a;}};
-  await phasedUpload(api,async()=>{},job().route,Buffer.from("x"),"a.txt","a",new AbortController().signal,()=>{});
+  const uploaded=await phasedUpload(api,async()=>{},job().route,Buffer.from("x"),"a.txt","a",new AbortController().signal,()=>{});
   assert.deepEqual(complete,{files:[{id:"F123",title:"a"}],channel_id:"C111",thread_ts:job().route.thread});
+  assert.deepEqual(uploaded,{fileId:"F123"});
 });
 test("off during URL allocation prevents binary upload and share",async()=>{
   const gate=deferred<typeof target>();let puts=0;let shares=0;let stopped=false;

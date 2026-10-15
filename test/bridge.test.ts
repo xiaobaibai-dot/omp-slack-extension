@@ -48,11 +48,30 @@ test("same-thread continuity is bounded and never passed to another channel or a
   for(const event of [envelope("Ev1","C111","secret A","UOWNER",thread),envelope("Ev2","C111","follow A","UOWNER",thread),envelope("Ev3","C222","B"),envelope("Ev4","D333","private","UOWNER"),envelope("Ev5","D333","other","UOTHER")]){b.accept(event);await settle();}
   assert.deepEqual(inputs.map(x=>x.history),[[],["secret A"],[],[],[]]);await b.stop();assert.equal(b.status().historyRoutes,0);
 });
-test("progress reply does not hide final answer; duplicate final is not reposted",async()=>{
+test("explicit reply suppresses automatic final explanation even when the text differs",async()=>{
   const t=new FakeTransport();let n=0;
   const b=new SlackBridge(config(),host(),()=>t,async(_i,c)=>{n++;await c.reply(n===1?"progress":"final");return "final";});
   await b.start();b.accept(envelope());await settle();b.accept(envelope("Ev2"));await settle();
-  assert.deepEqual(t.posts.map(x=>x.text),["progress","final","final"]);await b.stop();
+  assert.deepEqual(t.posts.map(x=>x.text),["progress","final"]);await b.stop();
+});
+test("without an explicit reply the final answer is sent automatically",async()=>{
+  const t=new FakeTransport();
+  const b=new SlackBridge(config(),host(),()=>t,async()=>"automatic final");
+  await b.start();b.accept(envelope());await settle();
+  assert.deepEqual(t.posts.map(x=>x.text),["automatic final"]);await b.stop();
+});
+test("explicit-send suppression is per request and history records the delivered reply",async()=>{
+  const t=new FakeTransport();let count=0;const history:string[][]=[];
+  const b=new SlackBridge(config(),host(),()=>t,async(input,c)=>{
+    history.push(input.history.map(h=>h.reply));
+    if(++count===1){await c.reply("requested body");return "Sent the body. §7§";}
+    return "next automatic final";
+  });
+  const thread=`${Math.floor(Date.now()/1000)}.000001`;
+  await b.start();b.accept(envelope("EvExplicit","C111","first","UOWNER",thread));await settle();
+  b.accept(envelope("EvAutomatic","C111","second","UOWNER",thread));await settle();
+  assert.deepEqual(t.posts.map(x=>x.text),["requested body","next automatic final"]);
+  assert.deepEqual(history,[[],["requested body"]]);await b.stop();
 });
 test("origin-bound tools cannot enumerate unrelated private channels and cap thread pages",async()=>{
   const t=new FakeTransport();const b=new SlackBridge(config(),host(),()=>t,async(_i,c)=>{

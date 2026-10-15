@@ -18,7 +18,7 @@ function runtime(session:Session):SdkRuntime {return {create:async()=>session,se
 const options={} as CreateAgentSessionOptions;
 test("SDK options keep host transcript and global lifecycle out of isolated worker",()=>{
   const r=runtime(new Session());const host={cwd:"/fake/workspace",model:{id:"fake"} as never,modelRegistry:{} as never};
-  const o=isolatedOptions(r,host,config(),[],"trusted policy");
+  const o=isolatedOptions(r,host,config({maxTaskMs:60_000}),[],"trusted policy");
   assert.equal(o.bindProcessState,false);assert.match(o.parentTaskPrefix!,/^slack-/);assert.equal(o.restrictToolNames,true);
   assert.equal(o.allowRestrictedCustomTools,true);assert.equal(o.enableMCP,false);assert.equal(o.enableIrc,false);assert.equal(o.enableLsp,false);
   assert.deepEqual(o.contextFiles,[]);assert.deepEqual(o.skills,[]);assert.deepEqual(o.rules,[]);assert.equal(o.disableExtensionDiscovery,true);

@@ -10,7 +10,7 @@ function result(data: unknown) { return {content: [{type: "text" as const, text:
 export function makeSlackTools(z: ExtensionAPI["zod"], capabilities: Capabilities): ToolDefinition[] {
   return [
     {name: "slack_reply", label: "Reply to source Slack thread", loadMode: "essential", approval: "write",
-      description: "Send plain text only to this authenticated request's original Slack thread. No channel override. Use only when the owner requested a reply; otherwise final answer is sent automatically.",
+      description: "Send text to the active request's original Slack thread. Canonical <@USER_ID> syntax produces a real Slack user mention. After a successful explicit reply, the bridge does not also send your final explanation. Without this tool, the final answer is sent automatically.",
       parameters: z.object({text: z.string()}),
       async execute(_id, params) { await capabilities.reply(stringArgument(params, "text")!); return result({sent: true}); }},
     {name: "slack_read_thread", label: "Read source Slack thread", loadMode: "essential", approval: "read",
@@ -18,11 +18,18 @@ export function makeSlackTools(z: ExtensionAPI["zod"], capabilities: Capabilitie
       parameters: z.object({cursor: z.string().optional()}),
       async execute(_id, params) { return result(await capabilities.readThread(stringArgument(params, "cursor", true))); }},
     {name: "slack_upload_file", label: "Upload output file to source thread", loadMode: "essential", approval: "write",
-      description: "Upload an explicitly requested artifact from the dedicated configured output root to the source Slack thread. Relative path only, at most 10 MiB. Disabled without an upload root. Never upload secrets or unrelated files.",
+      description: "Upload a file explicitly requested in the active Slack turn to its source thread, subject to OMP tool approval. Host upload mode accepts absolute paths or paths relative to the bound workspace; legacy output-root mode accepts relative paths only. At most 10 MiB. Never upload credentials or unrelated files.",
       parameters: z.object({relative_path: z.string(), title: z.string().optional()}),
-      async execute(_id, params) { await capabilities.upload(stringArgument(params, "relative_path")!, stringArgument(params, "title", true)); return result({uploaded: true}); }},
+      async execute(_id, params) { const uploaded = await capabilities.upload(stringArgument(params, "relative_path")!, stringArgument(params, "title", true)); return result({uploaded: true, ...(uploaded ?? {})}); }},
     {name: "slack_list_conversations", label: "List authorized Slack conversations", loadMode: "essential", approval: "read",
       description: "List conversations authorized for this request. Remote requests are restricted to their source conversation, so other private channel names cannot leak.",
       parameters: z.object({}), async execute() { return result(await capabilities.listConversations()); }},
+    {name: "slack_download_file", label: "Download source Slack file", loadMode: "essential", approval: "write",
+      description: "Download an explicitly requested Slack file shared in the active source conversation to a new local path. Requires files:read. Relative paths use the bound workspace; absolute paths are supported. Normal OMP write approval applies. Does not overwrite existing files. Returns bytes and SHA-256.",
+      parameters: z.object({file_id: z.string(), target_path: z.string()}),
+      async execute(_id, params) {
+        if (!capabilities.download) throw new Error("Slack downloads are unavailable.");
+        return result(await capabilities.download(stringArgument(params, "file_id")!, stringArgument(params, "target_path")!));
+      }},
   ];
 }

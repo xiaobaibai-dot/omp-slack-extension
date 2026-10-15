@@ -31,7 +31,7 @@ export function isolatedOptions(runtime: SdkRuntime, host: ModelContext, config:
     disableExtensionDiscovery: true, extensions: [], additionalExtensionPaths: [],
     skills: [], rules: [], contextFiles: [], promptTemplates: [], slashCommands: [], additionalDirectories: [],
     enableMCP: false, enableLsp: false, enableIrc: false, skipPythonPreflight: true,
-    deadline: Date.now() + config.maxTaskMs,
+    deadline: config.maxTaskMs === undefined ? undefined : Date.now() + config.maxTaskMs,
     cacheWarming: false, hasUI: false, interactivePrompts: false, spawns: "",
   };
 }

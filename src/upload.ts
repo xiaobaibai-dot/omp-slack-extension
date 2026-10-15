@@ -4,7 +4,7 @@ export interface UploadApi {
   complete(args: {files:[{id:string; title:string}]; channel_id:string; thread_ts:string}): Promise<unknown>;
 }
 export type PutBytes = (url:string, bytes:Uint8Array, signal:AbortSignal) => Promise<void>;
-export async function phasedUpload(api:UploadApi, put:PutBytes, route:Route, content:Buffer, filename:string, title:string, signal:AbortSignal, guard:()=>void):Promise<void> {
+export async function phasedUpload(api:UploadApi, put:PutBytes, route:Route, content:Buffer, filename:string, title:string, signal:AbortSignal, guard:()=>void):Promise<{fileId:string}> {
   guard(); signal.throwIfAborted();
   const target=await api.getURL({filename,length:content.byteLength});
   guard(); signal.throwIfAborted();
@@ -16,4 +16,5 @@ export async function phasedUpload(api:UploadApi, put:PutBytes, route:Route, con
   // This is the only phase that shares the uploaded file with the conversation.
   await api.complete({files:[{id:target.file_id,title}],channel_id:route.channel,thread_ts:route.thread});
   guard(); signal.throwIfAborted();
+  return {fileId:target.file_id};
 }
