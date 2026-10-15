@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { SlackTransport } from "../src/slack-transport.ts";
+import { FakeClock, flush } from "./fake-clock.ts";
 import { config, deferred, settle } from "./helpers.ts";
 const identity = {ok: true, team_id: "T123", user_id: "UBOT", bot_id: "BBOT"};
 const require = createRequire(import.meta.url);
@@ -49,31 +50,26 @@ test("off cancels pending SDK start and a late authenticated response cannot con
   assert.equal(socket!.websocket, undefined);
   assert.equal(transport.isReady(), false);
 });
-test("real SDK close uses managed reconnect and a rejected reconnect is handled and stops the transport", async t => {
+test("unknown reconnect failures stop after three failures, not forever", async t => {
   mockApi(t, async () => identity);
-  let socket: SocketModeClient | undefined; let starts = 0;
+  const clock = new FakeClock();let socket: SocketModeClient | undefined;let starts = 0, lost = 0;
   t.mock.method(SocketModeClient.prototype, "start", async function(this: SocketModeClient) {
-    socket = this; if (++starts > 1) throw new Error("fixture reconnect failed"); this.emit("connected"); return {ok: true};
+    socket = this;if (++starts > 1) throw new Error("PRIVATE unknown fixture");this.emit("connected");return {ok: true};
   });
-  const lost = deferred<unknown>();
-  const transport = new SlackTransport(config());
-  await transport.start(() => {}, error => lost.resolve(error));
-  socket!.emit("close");
-  assert.equal(transport.isReady(), false);
-  await deadline(lost.promise, 2000);
-  assert.equal(starts, 2); assert.equal(transport.isReady(), false);
-  await transport.stop();
+  const transport = new SlackTransport(config(), clock);
+  try {
+    await transport.start(() => {}, () => {lost++;});socket!.emit("close");
+    await clock.advance(30_000);assert.equal(starts, 4);assert.equal(lost, 1);assert.equal(transport.isReady(), false);
+    assert.equal(transport.connectionStatus().state, "stopped");await clock.advance(300_000);assert.equal(starts, 4);
+  } finally {await transport.stop();}
 });
 test("off clears a scheduled reconnect before any additional SDK start", async t => {
   mockApi(t, async () => identity);
-  let socket: SocketModeClient | undefined; let starts = 0;
-  t.mock.method(SocketModeClient.prototype, "start", async function(this: SocketModeClient) {
-    socket = this; ++starts; this.emit("connected"); return {ok: true};
-  });
-  const transport = new SlackTransport(config());
-  await transport.start(() => {}); socket!.emit("close"); await transport.stop();
-  await new Promise(resolve => setTimeout(resolve, 1100));
-  assert.equal(starts, 1);
+  const clock = new FakeClock();let socket: SocketModeClient | undefined;let starts = 0;
+  t.mock.method(SocketModeClient.prototype, "start", async function(this: SocketModeClient) {socket = this;++starts;this.emit("connected");return {ok: true};});
+  const transport = new SlackTransport(config(), clock);
+  await transport.start(() => {});socket!.emit("close");await flush();await transport.stop();
+  await clock.advance(120_000);assert.equal(starts, 1);assert.equal(clock.timers.size, 0);
 });
 test("a supplied auth app identity from another app is refused before Socket Mode starts", async t => {
   mockApi(t, async () => ({...identity, app_id: "AOTHER"}));
@@ -89,6 +85,6 @@ test("disconnect after handshake before start continuation cannot mark transport
     this.emit("connected"); this.emit("close"); return {ok: true};
   });
   const transport = new SlackTransport(config());
-  await assert.rejects(transport.start(() => {}), /disconnected during/);
+  await assert.rejects(transport.start(() => {}), /socket_closed/);
   assert.equal(transport.isReady(), false); await transport.stop();
 });

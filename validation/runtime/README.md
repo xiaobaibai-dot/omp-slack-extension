@@ -37,10 +37,16 @@ The suite writes synthetic observations, provider inputs, post routes and heartb
 
 ## Limits
 
-This does not validate live Slack, real LLM reasoning/tool-calling, Windows, a real training program, every tool's cancellation semantics or prolonged network outages. All Slack sources share the host conversation and tools; safe reply routing does not provide semantic context isolation. Existing one-shot reconnect behavior is unchanged.
+This does not validate live Slack, real LLM reasoning/tool-calling, Windows, a real training program, every tool's cancellation semantics or prolonged network outages. All Slack sources share the host conversation and tools; safe reply routing does not provide semantic context isolation. The reconnect revision adds a real transport supervisor at a faulted SDK network boundary; it does not verify a live Slack connection.
 
 An independent anonymous OpenCode free-model smoke returned HTTP **403 / FreeTierError** on the first text request: “OpenCode's free tier can only be used from within OpenCode.” It was stopped without retries, impersonation, IP changes, credentials or paid fallback. No live tool-call test passed, and the response does not establish an IP rate limit. This harness never repeats that rejected external request.
 
 ## Additional model-limit coverage
 
 The quota-notification revision adds two scenarios (12 total): actual error/success AgentSession events trigger sanitized same-thread notices, repeated failures dedupe, later natural success sends recovery without extra provider calls, and off blocks later notices. The second test uses an explicitly correlated synthetic MockModel response/request ID plus Retry-After to verify the optional header path. Common real providers do not expose failed HTTP429 headers or a common response/request ID, so their recovery time remains unknown. See [provider-notice limits](../../docs/provider-notices.md).
+
+## Additional reconnection coverage
+
+The reconnect revision passed **157 unit tests + typecheck** and **14/14 real-runtime scenarios** in the cloud. It adds two scenarios (**14 total**): the actual plugin transport supervisor retries an SDK connection reset while a real OMP foreground heartbeat runs and another source waits in the native queue. Both final replies retain their original threads, the subprocess completes **150 ticks / exit 0 / signal aborts 0**, and exactly two remote user prompts are consumed with no rerun. The other scenario closes the listener during real transport backoff; no reconnect happens afterward, replies remain revoked, and the subprocess completes **40 ticks / exit 0 / signal aborts 0**. Both scenarios call the actual transport lifecycle, replacing only the Slack SDK network methods. Provider content remains MockModel. `socketFaults` and heartbeat evidence are included in the ignored event log.
+
+The prior twelve scenarios retain their higher-level SlackTransport fake. Therefore only the final two test the actual reconnect supervisor together with AgentSession; the fake-clock unit suite supplies additional socket fault and cancellation coverage. See the [reconnection limits](../../docs/reconnect.md), including first-enable behavior and no offline outbox.

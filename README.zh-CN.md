@@ -87,7 +87,7 @@ Slack 请求沿用绑定会话的全部现有工具和审批规则；不需要�
 
 **off、断连、接管均不是执行终止开关。** 立即停止接收并撤销回复权限；只按完整文本精确移除两个原生通道中仍可编辑的本插件消息，包括在 TUI 中提升为 steer 的 follow-up。已进入 idle preflight、已经领取/live-steered 或已经消费的工作可能继续。不会 abort 主会话，也不清除无关原生队列项。切换会话时旧路由失效，原生 generation 校验与 admission 守卫阻止旧提交进入新会话。已提交给 Slack 的写入不能回滚，重新启用也不重放已撤销请求。
 
-网络层独立保留时限：Web API 单次尝试 10 秒，文件 HTTP 单次尝试 30 秒。读取请求遇到瞬时网络错误或可重试 5xx 使用指数退避和 jitter，最多 4 次尝试、总计不超过 2 分钟；明确拒绝的 429 至少等待 [Slack 的 Retry-After](https://docs.slack.dev/apis/web-api/rate-limits)。SDK 内部 HTTP 重试保持关闭，避免重试叠加。认证、权限和参数错误不重试；Socket Mode 保留现有连接等待及重连行为。
+网络层独立保留时限：Web API 单次尝试 10 秒，文件 HTTP 单次尝试 30 秒。读取请求遇到瞬时网络错误或可重试 5xx 使用指数退避和 jitter，最多 4 次尝试、总计不超过 2 分钟；明确拒绝的 429 至少等待 [Slack 的 Retry-After](https://docs.slack.dev/apis/web-api/rate-limits)。SDK 内部 HTTP 重试保持关闭，避免重试叠加。认证、权限和参数错误不重试。成功启用后，Socket Mode 对临时故障使用可取消的指数退避和抖动自动重连，并遵守 Retry-After；明确凭据/配置错误停下提示。首次启用的 Socket Mode 建立失败仍需重新执行 /slack。暂断保留原生任务及原线程回复权限，不重跑、不补发结果不确定的消息，也不增加离线消息箱。[完整重连策略与边界](docs/reconnect.md)。
 
 消息发送和文件上传各阶段只重试明确拒绝的 429。丢失响应、网络超时或不确定的 5xx 报告 `network_outcome_uncertain` 并撤销该来源请求的回复权限，不盲目重发，也不再自动发送另一份最终回答。[上传完成方法只能调用一次](https://docs.slack.dev/reference/methods/files.completeUploadExternal)。不增加 scope，也不假设未支持的幂等保证。`No automatic retry` 指不会重跑整个 agent 任务，网络重试只发生在单个 HTTP 请求内。
 
@@ -105,7 +105,7 @@ npm run check
 
 ### 云端真实运行时验证
 
-[可复现的 OMP 18.10.4 测试](validation/runtime/README.md) 在 Linux 上运行，不需要 Slack 或模型凭据。10 项测试执行真实调度、wait、子进程、路由、关闭/接管和会话切换；模型内容及 Slack 网络边界使用模拟。
+[可复现的 OMP 18.10.4 测试](validation/runtime/README.md) 在 Linux 上运行，不需要 Slack 或模型凭据。14 项测试执行真实调度、wait、子进程、路由、关闭/接管、会话切换、模型额度通知和传输重连；模型内容及 Slack 网络边界使用模拟，其中重连场景执行插件真实的重连管理代码。
 
 ### 模型额度和限流提醒
 

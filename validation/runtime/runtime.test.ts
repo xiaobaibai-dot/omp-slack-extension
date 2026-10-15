@@ -14,6 +14,10 @@ const {AsyncJobManager}=await import('@oh-my-pi/pi-coding-agent/async/job-manage
 const {default:slackExtension}=await import('./candidate/index.ts');
 const {SlackTransport}=await import('./candidate/src/slack-transport.ts');
 const {LocalBinding}=await import('./candidate/src/binding.ts');
+const {SocketModeClient}=await import('@slack/socket-mode');
+const {WebClient}=await import('@slack/web-api');
+const transportMethods=['start','stop','isReady','post','connectionStatus'] as const;
+const realTransportMethods=Object.fromEntries(transportMethods.map(name=>[name,SlackTransport.prototype[name]]));
 
 const namespace=`omp-real-runtime-${process.pid}`;
 const originalAcquire=LocalBinding.acquire;
@@ -55,7 +59,7 @@ async function fixture(name:string,handler:any,options:{effect?:Function,maxQueu
   const command=(arg:string)=>session.prompt(`/slack${arg?' '+arg:''}`);
   await command('');assert.equal(transports.size,1,notices.join('\n'));
   const receive=[...transports.values()][0]!.receive;
-  return {session,mock,jobs:session.asyncJobManager!,evidence,notices,errors,events,root,command,receive,send:(text:string,channel?:string,thread?:string,user?:string)=>receive(envelope(text,channel,thread,user)),get posts(){return posts.slice(start);},get aborts(){return aborts;},async close(){await command('off');const abortsBeforeCleanup=aborts;await session.dispose();await jobs.dispose({timeoutMs:1000});auth.close();rows.push({name,heartbeat:evidence.heartbeat?{pid:evidence.heartbeat.pid,exit:evidence.heartbeat.exit,ticks:evidence.heartbeat.ticks,signalAborts:evidence.heartbeat.signalAborts,finalSignalAborted:evidence.heartbeat.signal?.aborted}:undefined,explicitSdkSessionSwitch:evidence.explicitSdkSessionSwitch??false,providerCalls:mock.calls.length,events,providerInputs:mock.calls.map(c=>c.context.messages.map(m=>({role:m.role,text:textOf(m),toolName:m.toolName}))),notices,errors,postRoutes:posts.slice(start).map(p=>({channel:p.route.channel,thread:p.route.thread})),abortsBeforeCleanup});}};
+  return {session,mock,jobs:session.asyncJobManager!,evidence,notices,errors,events,root,command,receive,send:(text:string,channel?:string,thread?:string,user?:string)=>receive(envelope(text,channel,thread,user)),get posts(){return posts.slice(start);},get aborts(){return aborts;},async close(){await command('off');const abortsBeforeCleanup=aborts;await session.dispose();await jobs.dispose({timeoutMs:1000});auth.close();rows.push({name,heartbeat:evidence.heartbeat?{pid:evidence.heartbeat.pid,exit:evidence.heartbeat.exit,ticks:evidence.heartbeat.ticks,signalAborts:evidence.heartbeat.signalAborts,finalSignalAborted:evidence.heartbeat.signal?.aborted}:undefined,explicitSdkSessionSwitch:evidence.explicitSdkSessionSwitch??false,socketFaults:evidence.socketFaults,providerCalls:mock.calls.length,events,providerInputs:mock.calls.map(c=>c.context.messages.map(m=>({role:m.role,text:textOf(m),toolName:m.toolName}))),notices,errors,postRoutes:posts.slice(start).map(p=>({channel:p.route.channel,thread:p.route.thread})),abortsBeforeCleanup});}};
 }
 
 test('actual AgentSession queues followUp FIFO, routes four threads and answers status without a model call',async()=>{
@@ -204,4 +208,59 @@ test('real response hook can expose a current failure Retry-After; successful he
     const date=/\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} UTC/.exec(f.posts[0]!.text)?.[0];assert.ok(date);const suggested=Date.parse(date!.replace(' UTC','Z').replace(' ','T'));assert.ok(suggested>=started+120000&&suggested<=Date.now()+120000);
     await f.command('off');await f.session.prompt('local natural success after off');await f.session.waitForIdle();assert.equal(f.posts.length,1);assert.equal(calls,2);assert.equal(f.aborts,0);
   }finally{await f.close();}
+},20000);
+
+
+// Fault only the Slack SDK network boundary; run the actual plugin transport supervisor.
+// Existing twelve tests retain their smaller transport seam. All agent events remain real.
+async function socketBoundary(failures:number,body:(faults:{sockets:any[],starts:()=>number,httpCalls:string[]})=>Promise<void>){
+  const saved=Object.fromEntries(transportMethods.map(name=>[name,SlackTransport.prototype[name]]));
+  const originalStart=SocketModeClient.prototype.start,originalDisconnect=SocketModeClient.prototype.disconnect,originalApi=WebClient.prototype.apiCall;
+  const sockets:any[]=[],httpCalls:string[]=[];let starts=0;
+  for(const name of transportMethods)(SlackTransport.prototype as any)[name]=realTransportMethods[name];
+  SlackTransport.prototype.start=async function(receive,disconnect,onState){const result=await realTransportMethods.start.call(this,receive,disconnect,onState);transports.set(this,{receive,disconnect});return result;};
+  SlackTransport.prototype.stop=async function(){await realTransportMethods.stop.call(this);transports.delete(this);};
+  SocketModeClient.prototype.start=async function(){sockets.push(this);starts++;if(starts>1&&starts<=failures+1)throw {code:'slack_webapi_request_error',original:{code:'ECONNRESET'}};this.emit('connected');return {ok:true};};
+  SocketModeClient.prototype.disconnect=async function(){this.emit('disconnected');};
+  WebClient.prototype.apiCall=async function(method,args){httpCalls.push(method);if(method==='auth.test')return {ok:true,team_id:'T123',user_id:'UBOT',bot_id:'BBOT'};
+    if(method==='chat.postMessage'){posts.push({route:{team:'T123',channel:args.channel,thread:args.thread_ts,user:'UOWNER'},text:args.text});return {ok:true};}
+    throw new Error(`Forbidden network method in fault fixture: ${method}`);
+  };
+  try{await body({sockets,starts:()=>starts,httpCalls});}finally{
+    for(const name of transportMethods)(SlackTransport.prototype as any)[name]=saved[name];
+    SocketModeClient.prototype.start=originalStart;SocketModeClient.prototype.disconnect=originalDisconnect;WebClient.prototype.apiCall=originalApi;
+  }
+}
+test('real transport reconnect failures preserve active native tool and queued thread ownership without task replay',async()=>{
+  await socketBoundary(1,async faults=>{
+    const started=gate(),done=gate(),stats={signalAborts:0,totalTicks:150} as any;let calls=0;
+    const f=await fixture('reconnect-native',context=>++calls===1?tool('fixture_effect'):response(`after reconnect:${requestOf(context)?.route.thread}`),{effect:(signal:AbortSignal,root:string)=>heartbeat(signal,root,started,done,stats)});
+    f.evidence.heartbeat=stats;
+    try{
+      f.send('long bounded work','C111','1700000000.013001');await started.promise;
+      f.send('second source stays natively queued','D333','1700000000.013002');await until(()=>f.session.getQueuedMessages().followUp.length===1,'second native source queued');
+      faults.sockets[0].emit('close');await until(()=>f.notices.some(n=>n.includes('reconnecting automatically')),'reconnect transition');
+      await f.command('status');const status=JSON.parse(f.notices.findLast(n=>n.startsWith('{"state"'))!);
+      assert.equal(status.state,'on');assert.equal(status.connection.state,'reconnecting');assert.equal(f.aborts,0);assert.equal(stats.signalAborts,0);assert.equal(calls,1);
+      await until(()=>faults.starts()===3&&[...transports.keys()][0]!.isReady(),'second reconnect attempt succeeds');
+      assert.equal(calls,1);assert.equal(f.session.getQueuedMessages().followUp.length,1);process.kill(stats.pid,0);
+      await done.promise;await f.session.waitForIdle();await until(()=>f.posts.length===2,'two preserved reply routes');
+      assert.deepEqual(f.posts.map(p=>[p.route.channel,p.route.thread]),[['C111','1700000000.013001'],['D333','1700000000.013002']]);
+      assert.equal(calls,3);assert.equal(stats.exit,0);assert.equal(stats.ticks,150);assert.equal(stats.signalAborts,0);assert.equal(f.aborts,0);
+      assert.equal(f.events.filter(e=>e.type==='message_start'&&e.role==='user'&&e.text?.startsWith('[OMP Slack request')).length,2);
+      f.evidence.socketFaults={starts:faults.starts(),rejectedReconnects:1,httpCalls:[...faults.httpCalls],posts:f.posts.length};
+    }finally{await done.promise;await f.close();}
+  });
+},20000);
+test('off during actual transport backoff cancels reconnect and preserves the running native subprocess',async()=>{
+  await socketBoundary(10,async faults=>{
+    const started=gate(),done=gate(),stats={signalAborts:0,totalTicks:40} as any;let calls=0;
+    const f=await fixture('reconnect-off',()=>++calls===1?tool('fixture_effect'):response('revoked after off'),{effect:(signal:AbortSignal,root:string)=>heartbeat(signal,root,started,done,stats)});
+    f.evidence.heartbeat=stats;
+    try{f.send('work through offline stop');await started.promise;faults.sockets[0].emit('close');await until(()=>f.notices.some(n=>n.includes('reconnecting automatically')),'backoff entered');
+      await f.command('off');assert.equal(f.aborts,0);assert.equal(transports.size,0);await done.promise;await f.session.waitForIdle();await Bun.sleep(100);
+      assert.equal(faults.starts(),1);assert.equal(f.posts.length,0);assert.equal(stats.exit,0);assert.equal(stats.ticks,40);assert.equal(stats.signalAborts,0);assert.equal(f.aborts,0);
+      f.evidence.socketFaults={starts:faults.starts(),httpCalls:[...faults.httpCalls],posts:f.posts.length};
+    }finally{await done.promise;await f.close();}
+  });
 },20000);

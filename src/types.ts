@@ -35,8 +35,9 @@ export interface ThreadPage {
 }
 export interface Conversation { id: string; name: string; isPrivate?: boolean; isIm: boolean }
 export interface Transport {
-  start(onEvent: (body: unknown) => void, onDisconnect?: (error: unknown) => void): Promise<{ teamId: string; botUserId: string }>;
+  start(onEvent: (body: unknown) => void, onDisconnect?: (error: unknown) => void, onState?: (status: import("./reconnect.ts").ConnectionStatus) => void): Promise<{ teamId: string; botUserId: string }>;
   isReady?(): boolean;
+  connectionStatus?(): import("./reconnect.ts").ConnectionStatus;
   stop(): Promise<void>;
   post(route: Route, text: string, signal?: AbortSignal): Promise<void>;
   readThread(route: Route, cursor?: string, signal?: AbortSignal): Promise<ThreadPage>;

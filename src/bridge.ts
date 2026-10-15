@@ -43,7 +43,7 @@ export class SlackBridge {
   get state(): State { return this.#state; }
   status() {
     const native = this.host.status?.();
-    return {state: this.#state, pending: this.#requests.size, busy: this.#requests.size > 0, historyRoutes: this.#history.size, native};
+    return {state: this.#state, pending: this.#requests.size, busy: this.#requests.size > 0, historyRoutes: this.#history.size, connection: this.#transport?.connectionStatus?.(), native};
   }
   async start(): Promise<void> {
     if (this.#state !== "off") return;
@@ -59,6 +59,11 @@ export class SlackBridge {
         if (generation !== this.#generation || this.#state === "off") return;
         void this.stop("transport_disconnected").catch(() => {});
         this.host.notify(`Slack disconnected (${safeError(error)}). Reply routes were revoked; already admitted native work may continue. Run /slack to reconnect.`, "warning");
+      }, status => {
+        if (generation !== this.#generation || this.#state === "off") return;
+        // Transport status only. Temporary outages preserve native work and reply ownership.
+        if (status.state === "reconnecting" && status.failures === 1) this.host.notify("Slack connection interrupted; reconnecting automatically. Native work continues.", "warning");
+        if (status.state === "connected" && status.failures > 0) this.host.notify("Slack receiving connection restored. Tasks and uncertain deliveries were not replayed.");
       });
       if (generation !== this.#generation || this.#state !== "starting") { await this.stop(); return; }
       if (identity.teamId !== this.config.teamId || !identity.botUserId) throw new Error("Slack bot workspace does not match configured workspace.");
@@ -125,7 +130,7 @@ export class SlackBridge {
       if (this.#state !== "on" || generation !== this.#generation) return;
       const status = this.host.status?.(job.route);
       const text = kind === "usage" ? "Use !insert TEXT / !steer TEXT, !queue TEXT, or !status. Ordinary messages use OMP follow-up." :
-        JSON.stringify({state: this.#state, scope: "your source thread only", defaultDelivery: "followUp", native: status ?? null});
+        JSON.stringify({state: this.#state, scope: "your source thread only", defaultDelivery: "followUp", connection: transport.connectionStatus?.(), native: status ?? null});
       await transport.post(job.route, text, controller.signal);
     } catch (error) {
       if (!controller.signal.aborted) this.host.notify(`Slack control reply failed (${safeError(error)}). No automatic retry.`, "warning");
@@ -240,7 +245,7 @@ export class SlackBridge {
   async providerNotice(route: Route, notice: ProviderNotice): Promise<boolean> {
     // Internal system notification only; never an agent tool, prompt or task retry.
     const transport = this.#transport, generation = this.#generation;
-    if (this.#state !== "on" || !transport || transport.isReady?.() === false ||
+    if (this.#state !== "on" || !transport ||
       route.team !== this.config.teamId || !requesterAllowed(this.config, route.user, route.channel) || this.#controls.size >= 128) return false;
     const controller = new AbortController();this.#controls.add(controller);
     try {
