@@ -1,3 +1,5 @@
+import {ProviderNotices} from "./provider-notices.ts";
+import type {ProviderNotice, ProviderIdentity} from "./provider-notices.ts";
 import {randomUUID} from "node:crypto";
 import type {AgentSession} from "@oh-my-pi/pi-coding-agent";
 import type {RunInput} from "./bridge.ts";
@@ -42,7 +44,9 @@ export class NativeSession {
   #candidate?: string;
   #liveSteered = 0;
   #activity?: HostActivity;
-  constructor(session: HostSession, isCurrent: () => boolean, onActivity?: (activity: HostActivity) => void) {
+  readonly #providerNotices: ProviderNotices;
+  constructor(session: HostSession, isCurrent: () => boolean, onActivity?: (activity: HostActivity) => void, onProviderNotice: (route: Route, notice: ProviderNotice) => Promise<boolean> = async () => false) {
+    this.#providerNotices = new ProviderNotices(onProviderNotice);
     this.session = session;this.isCurrent = isCurrent;this.#localActive = session.isStreaming;
     this.#liveSteered = session.getQueuedMessages().liveSteered;
     this.#unsubscribe = session.subscribe((event: any) => {
@@ -57,6 +61,9 @@ export class NativeSession {
       }
       this.#observe(event);
     });
+  }
+  providerResponse(event: {status: number; headers: Record<string, unknown>; requestId?: string | null}, model: ProviderIdentity) {
+    if (!this.#disposed && this.isCurrent()) this.#providerNotices.response(event, model);
   }
   get localTurn(): boolean {
     const lastInput = [...this.session.messages].reverse().find(isUserInput);
@@ -145,7 +152,7 @@ export class NativeSession {
   }
   dispose() {
     if (this.#disposed) return;
-    this.#disposed = true;
+    this.#disposed = true;this.#providerNotices.dispose();
     for (const record of [...this.#records.values()]) {
       this.#withdraw(record);this.#finish(record, undefined, requestError("session_cancelled"));
     }
@@ -186,6 +193,7 @@ export class NativeSession {
     this.#mixed = false;this.#localActive = false;this.#candidate = undefined;this.#boundary = false;
   }
   #observe(event: any) {
+    if (event.type === "turn_start") this.#providerNotices.beginTurn();
     if (event.type === "queue_update") {
       this.#liveSteered = event.liveSteered ?? 0;
       if (this.#liveSteered) {this.#mixed = true;this.#candidate = undefined;}
@@ -211,6 +219,8 @@ export class NativeSession {
       const lastInput = [...this.session.messages].reverse().find(isUserInput);
       const owner = this.#owner(textOf(lastInput));
       if (this.#consumed.size && (!owner || !this.#consumed.has(owner))) this.#mixed = true;
+      const noticeRoutes = owner && this.#consumed.has(owner) ? [...this.#consumed].filter(record => !record.settled && !record.signal.aborted).map(record => record.input.job.route) : [];
+      this.#providerNotices.observe(event.message, noticeRoutes);
       this.#candidate = answerOf(event.message);
       this.#boundary = Boolean(this.#candidate);
       // Error/aborted turns can trigger OMP recovery. Keep their consumed owners

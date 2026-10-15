@@ -75,7 +75,8 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
         const boundSessionId = mainSession.sessionId;
         const boundNative = new NativeSession(mainSession,
           () => generation === lifecycle && context?.sessionManager === mainSession.sessionManager && mainSession.sessionId === boundSessionId,
-          activity => {lastActivity = activity;});
+          activity => {lastActivity = activity;},
+          (route, notice) => generation === lifecycle && candidate ? candidate.providerNotice(route, notice) : Promise.resolve(false));
         native = boundNative;
         candidate = new SlackBridge(config,
           {notify: (message, level) => context?.ui.notify(message, level ?? "info"),
@@ -131,6 +132,9 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
       const page = !native?.localTurn ? await capabilities(stringArgument(params, "request_id", true)).listConversations() : await bridge.listConversations(stringArgument(params, "cursor", true));
       return {content: [{type: "text", text: JSON.stringify(page)}], details: {}};
     }});
+  pi.on("after_provider_response", (event, ctx) => {
+    if (context?.sessionManager === ctx.sessionManager && ctx.model) native?.providerResponse(event, ctx.model);
+  });
   pi.on("session_start", (_event, ctx) => { context = ctx; });
   pi.on("session_shutdown", async () => { await stop(true, "session_cancelled"); context = undefined; });
   pi.on("session_before_switch", async () => { await stop(true, "session_cancelled"); });

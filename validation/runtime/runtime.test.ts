@@ -184,3 +184,24 @@ test('duplicate event and stale socket callback cannot create native duplicate w
     await f.command('off');modelGate.resolve(response('revoked'));await f.session.waitForIdle();assert.equal(f.posts.length,0);
   }finally{modelGate.resolve(response('cleanup'));await f.close();}
 },20000);
+
+test('real runtime quota failure alerts original thread, dedupes and recovers only after natural same-model success',async()=>{
+  let calls=0;const f=await fixture('quota-notice',()=>++calls<3?{stopReason:'error',errorMessage:'429 insufficient_quota PRIVATE_TOKEN_SHOULD_NOT_APPEAR'}:response('natural successful final'));
+  try{
+    f.send('first quota request','G222','1700000000.011001');await until(()=>calls===1,'actual failed provider');await until(()=>f.posts.length===1,'first quota notice');await f.session.waitForIdle();
+    assert.match(f.posts[0]!.text,/额度/);assert.match(f.posts[0]!.text,/恢复时间未知/);assert.ok(!f.posts[0]!.text.includes('PRIVATE_TOKEN'));assert.equal(calls,1);
+    f.send('same route naturally retries','G222','1700000000.011001');await until(()=>calls===2,'second user-requested provider');await f.session.waitForIdle();await Bun.sleep(20);assert.equal(f.posts.length,1,'same incident is not repeatedly announced');
+    f.send('natural success elsewhere','D333','1700000000.011002');await until(()=>calls===3,'third user-requested provider');await f.session.waitForIdle();await until(()=>f.posts.length===3,'recovery plus final');
+    const recovered=f.posts.find(p=>p.text.includes('再次成功返回'))!;assert.equal(recovered.route.channel,'G222');assert.equal(recovered.route.thread,'1700000000.011001');assert.match(recovered.text,/不代表原账号额度已重置/);
+    assert.equal(f.posts.find(p=>p.text==='natural successful final')!.route.channel,'D333');assert.equal(calls,3);assert.equal(f.aborts,0);
+  }finally{await f.close();}
+},20000);
+
+test('real response hook can expose a current failure Retry-After; successful headers never imply recovery',async()=>{
+  let calls=0;const f=await fixture('quota-header',()=>++calls===1?{stopReason:'error',errorMessage:'429 rate_limit_exceeded',responseStatus:429,responseRequestId:'SYNTHETIC-COMMON-ID',responseId:'SYNTHETIC-COMMON-ID',responseHeaders:{'retry-after':'120','authorization':'PRIVATE_HEADER'}}:response('done'));
+  try{const started=Date.now();f.send('header error');await until(()=>f.posts.length===1,'header-aware notice');await f.session.waitForIdle();
+    assert.match(f.posts[0]!.text,/Retry-After/);assert.match(f.posts[0]!.text,/UTC/);assert.ok(!f.posts[0]!.text.includes('PRIVATE_HEADER'));
+    const date=/\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} UTC/.exec(f.posts[0]!.text)?.[0];assert.ok(date);const suggested=Date.parse(date!.replace(' UTC','Z').replace(' ','T'));assert.ok(suggested>=started+120000&&suggested<=Date.now()+120000);
+    await f.command('off');await f.session.prompt('local natural success after off');await f.session.waitForIdle();assert.equal(f.posts.length,1);assert.equal(calls,2);assert.equal(f.aborts,0);
+  }finally{await f.close();}
+},20000);

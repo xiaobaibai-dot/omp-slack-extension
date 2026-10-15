@@ -3,9 +3,10 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import {createHash, randomUUID} from "node:crypto";
 import {failureReason, requestError} from "./request-lifecycle.ts";
+import type {ProviderNotice} from "./provider-notices.ts";
 import type {CancellationReason, RequestLog, RequestReason} from "./request-lifecycle.ts";
 import {messageMode} from "./message-mode.ts";
-import type { Capabilities, Config, Host, Job, Transport } from "./types.ts";
+import type { Capabilities, Config, Host, Job, Route, Transport } from "./types.ts";
 export interface HistoryTurn { request: string; reply: string }
 export interface RunInput { job: Job; history: readonly HistoryTurn[]; requestId?: string }
 export type IsolatedRunner = (input: RunInput, capabilities: Capabilities, signal: AbortSignal) => Promise<string>;
@@ -235,6 +236,21 @@ export class SlackBridge {
       log("end");
       if (this.#requests.get(requestId)?.job === job) this.#requests.delete(requestId);
     }
+  }
+  async providerNotice(route: Route, notice: ProviderNotice): Promise<boolean> {
+    // Internal system notification only; never an agent tool, prompt or task retry.
+    const transport = this.#transport, generation = this.#generation;
+    if (this.#state !== "on" || !transport || transport.isReady?.() === false ||
+      route.team !== this.config.teamId || !requesterAllowed(this.config, route.user, route.channel) || this.#controls.size >= 128) return false;
+    const controller = new AbortController();this.#controls.add(controller);
+    try {
+      if (generation !== this.#generation || this.#state !== "on") return false;
+      await transport.post(route, notice.text, controller.signal);
+      return generation === this.#generation && this.#state === "on" && !controller.signal.aborted;
+    } catch (error) {
+      if (!controller.signal.aborted) this.host.notify(`Slack model notice could not be confirmed (${safeError(error)}). No automatic resend.`, "warning");
+      return false;
+    } finally {this.#controls.delete(controller);}
   }
   async listConversations(cursor?: string) {
     if (this.#state !== "on" || !this.#transport) throw new Error("Run /slack first.");

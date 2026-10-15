@@ -101,3 +101,7 @@ Native-channel tests use public-API protocol fixtures and pinned SDK type/source
 ### Reproducible cloud runtime
 
 [Run the real OMP 18.10.4 integration suite](validation/runtime/README.md) on Linux with no Slack or model credentials. Ten scenarios exercise native scheduling, real wait/subprocess behavior, routing, off/takeover and session switching; the model and Slack network boundaries are mocked.
+
+### Model quota and rate-limit notices
+
+Consumed Slack requests receive deduplicated, sanitized quota/429 notices in their original thread. Recovery is announced only after an actual successful same-model response, with no extra probe or task retry. A missing or uncorrelated provider reset time is explicitly unknown; OMP backoff is never advertised as quota recovery. See [interfaces and limits](docs/provider-notices.md).

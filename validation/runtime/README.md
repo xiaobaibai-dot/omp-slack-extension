@@ -40,3 +40,7 @@ The suite writes synthetic observations, provider inputs, post routes and heartb
 This does not validate live Slack, real LLM reasoning/tool-calling, Windows, a real training program, every tool's cancellation semantics or prolonged network outages. All Slack sources share the host conversation and tools; safe reply routing does not provide semantic context isolation. Existing one-shot reconnect behavior is unchanged.
 
 An independent anonymous OpenCode free-model smoke returned HTTP **403 / FreeTierError** on the first text request: “OpenCode's free tier can only be used from within OpenCode.” It was stopped without retries, impersonation, IP changes, credentials or paid fallback. No live tool-call test passed, and the response does not establish an IP rate limit. This harness never repeats that rejected external request.
+
+## Additional model-limit coverage
+
+The quota-notification revision adds two scenarios (12 total): actual error/success AgentSession events trigger sanitized same-thread notices, repeated failures dedupe, later natural success sends recovery without extra provider calls, and off blocks later notices. The second test uses an explicitly correlated synthetic MockModel response/request ID plus Retry-After to verify the optional header path. Common real providers do not expose failed HTTP429 headers or a common response/request ID, so their recovery time remains unknown. See [provider-notice limits](../../docs/provider-notices.md).
