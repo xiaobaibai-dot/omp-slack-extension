@@ -97,3 +97,7 @@ The bound OMP session records `omp_slack_request` custom entries with event ID, 
 Run `npm run check` for types and regressions covering native admission/consumption, queue/steer modes, multi-source reply ownership, direct status, existing member/bot authorization, dedupe, late admission/session-switch races, off without main-session abort, transport behavior and files. Legacy isolated SDK code/tests remain for historical regression only; the entry uses `NativeSession`.
 
 Native-channel tests use public-API protocol fixtures and pinned SDK type/source checks, not a real OMP model loop. Live Slack, native wait/background behavior, Windows, non-owner channel members, files and existing tool approvals need separate evidence. Mock tests do not establish those outcomes. See [the acceptance checklist](docs/windows-acceptance.md).
+
+### Reproducible cloud runtime
+
+[Run the real OMP 18.10.4 integration suite](validation/runtime/README.md) on Linux with no Slack or model credentials. Ten scenarios exercise native scheduling, real wait/subprocess behavior, routing, off/takeover and session switching; the model and Slack network boundaries are mocked.

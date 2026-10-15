@@ -102,3 +102,7 @@ npm run check
 检查包含类型、原生 admission/消费关联、队列/插入模式、多来源路由、状态直达、既有成员/bot 权限、去重、迟到 admission/会话切换竞态、零主会话 abort 的 off、网络和文件回归。仓库保留旧独立 SDK 模块及其历史测试；运行入口使用 `NativeSession`。
 
 本次原生通道测试使用公开 API 协议夹具及固定 SDK 的类型/源码校验，没有运行真实 OMP 模型循环。真实 Slack、wait/后台工具行为、Windows、获准非 owner/代理、文件和宿主审批都需单独验收，不能用 mock 通过代替。详见 [验收清单](docs/windows-acceptance.md)。
+
+### 云端真实运行时验证
+
+[可复现的 OMP 18.10.4 测试](validation/runtime/README.md) 在 Linux 上运行，不需要 Slack 或模型凭据。10 项测试执行真实调度、wait、子进程、路由、关闭/接管和会话切换；模型内容及 Slack 网络边界使用模拟。
