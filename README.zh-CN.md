@@ -89,7 +89,11 @@ Slack 请求沿用绑定会话的全部现有工具和审批规则；不需要�
 
 网络层独立保留时限：Web API 单次尝试 10 秒，文件 HTTP 单次尝试 30 秒。读取请求遇到瞬时网络错误或可重试 5xx 使用指数退避和 jitter，最多 4 次尝试、总计不超过 2 分钟；明确拒绝的 429 至少等待 [Slack 的 Retry-After](https://docs.slack.dev/apis/web-api/rate-limits)。SDK 内部 HTTP 重试保持关闭，避免重试叠加。认证、权限和参数错误不重试。成功启用后，Socket Mode 对临时故障使用可取消的指数退避和抖动自动重连，并遵守 Retry-After；明确凭据/配置错误停下提示。首次启用的 Socket Mode 建立失败仍需重新执行 /slack。暂断保留原生任务及原线程回复权限，不重跑、不补发结果不确定的消息，也不增加离线消息箱。[完整重连策略与边界](docs/reconnect.md)。
 
-消息发送和文件上传各阶段只重试明确拒绝的 429。丢失响应、网络超时或不确定的 5xx 报告 `network_outcome_uncertain` 并撤销该来源请求的回复权限，不盲目重发，也不再自动发送另一份最终回答。[上传完成方法只能调用一次](https://docs.slack.dev/reference/methods/files.completeUploadExternal)。不增加 scope，也不假设未支持的幂等保证。`No automatic retry` 指不会重跑整个 agent 任务，网络重试只发生在单个 HTTP 请求内。
+消息发送和文件上传各阶段仍只重试明确拒绝的 429。丢失响应、超时或不确定服务端错误不会盲目重发。失败不再中止整条来源请求：ZIP 结果不确定时，读取核验、独立 sidecar 和显式状态回复仍可继续。新增 `slack_delivery_status` 显示 operation ID、阶段、状态、已知 file ID 和白名单诊断；提供 `operation_id` 只核验、不重发。分配 URL/传字节阶段尚未调用完成分享，因此确认未分享，显式查看后可重新发起上传。完成阶段不确定时，仅 `files.info` 明确显示文件已分享到原线程才转为已交付；缺权限、找不到文件、缺少分享证据均不能证明未交付。不增加 scope。
+
+有界交付记录按线程和文件内容摘要阻止重复，改文件名或发起同线程新请求也不能绕过；确认成功的文件复用原 file ID。文字发送不确定时，保守阻止该线程的所有后续文字，避免换措辞重复发送，但不阻止来源读取和独立文件上传。未解决的交付会抑制自动最终回答。正常结束、本地输入和 off 仍撤销旧 request ID；同线程新消费请求可查看记录。记录在同一扩展工厂内跨 off/on 保留，**不跨进程重启、热加载、其他工厂或电脑持久化**，不是持久的 exactly-once 保证；重启后应先核验历史结果，不凭缺少记录重传。达到 1024 条时拒绝新增写入，不通过淘汰记录绕过防重复。[恢复方式与限制](docs/delivery-recovery.md)。
+
+[上传完成方法只能调用一次](https://docs.slack.dev/reference/methods/files.completeUploadExternal)。`No automatic retry` 指不会重跑整个 agent 任务。
 
 绑定的 OMP 会话保存 `omp_slack_request` 自定义日志项，包含 event ID、生成的 request ID、来源线程/消息 ID、开始结束时间和固定原因分类；不保存请求正文、回复、token、原始错误或工具内容。`/slack status` 直接读取 OMP 的 idle、待处理消息和 streaming 状态，并显示最近观察到的 agent/turn/message/tool 事件及工具数。Slack `!status` 只返回当前发送者/来源线程的计数，以及全局 streaming、最近观察到的活动计数和时间，不暴露其他来源 ID、正文或工具参数。即使达到未完成请求上限，也可直接查询；仍受 Slack 连通性/限流和最多 4 个并行控制回复约束。`claimed` 表示 admitted 但未出现在可编辑队列中、且尚未观察到消费，可能包括 preflight 或已移除待结算项。工具计数仅覆盖启用后的观察，不证明真实训练进程状态。快照仅供诊断，长时间思考或执行工具不会触发空闲取消或自动恢复。
 

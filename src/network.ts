@@ -7,9 +7,13 @@ export interface NetworkClock {
 export const networkClock: NetworkClock = {now: () => Date.now(), random: () => Math.random(),
   setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: timer => clearTimeout(timer)};
 export type NetworkCode = "network_timeout" | "network_retry_exhausted" | "network_outcome_uncertain" | "network_failed";
-export function networkError(code: NetworkCode) {
+export function networkError(code: NetworkCode, original?: unknown) {
   const message = code === "network_outcome_uncertain" ? "Slack delivery outcome is uncertain; stop and verify before resending." : `Slack network request failed (${code}).`;
-  return Object.assign(new Error(message), {code});
+  const e = record(original), status = e.statusCode ?? e.status ?? e.response?.status;
+  const rawCode = e.original?.code ?? e.cause?.code ?? e.data?.error ?? e.code;
+  const allowed = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND", "EPIPE", "ECONNABORTED", "network_timeout", "missing_scope", "invalid_auth", "internal_error", "fatal_error", "service_unavailable", "request_timeout", "slack_webapi_request_error", "ERR_BAD_RESPONSE"]);
+  const diagnostic = {category: code, ...(Number.isInteger(status) && status >= 100 && status <= 599 ? {httpStatus: status as number} : {}), ...(allowed.has(rawCode) ? {code: rawCode as string} : {})};
+  return Object.assign(new Error(message), {code, diagnostic});
 }
 function record(value: unknown): Record<string, any> {return value && typeof value === "object" ? value as Record<string, any> : {};}
 // These outcomes explicitly reject the submitted operation. Unknown transport
@@ -87,14 +91,14 @@ export async function retryNetwork<T>(operation: (signal: AbortSignal) => Promis
     catch (error) {
       if (signal.aborted) {
         // A cancelled write may already have committed. Never send it again.
-        if (kind === "mutation") throw networkError("network_outcome_uncertain");
+        if (kind === "mutation") throw networkError("network_outcome_uncertain", error);
         throw signal.reason;
       }
       const hint = retryHint(error, clock.now());
       // Certainty of mutation failure is independent of the read retry allowlist.
       // Any unproven outcome stops subsequent explicit and automatic delivery.
-      if (kind === "mutation" && !mutationRejected(error)) throw networkError("network_outcome_uncertain");
-      if (!hint.transient && !(hint.rateLimited && hint.after !== undefined)) throw networkError("network_failed");
+      if (kind === "mutation" && !mutationRejected(error)) throw networkError("network_outcome_uncertain", error);
+      if (!hint.transient && !(hint.rateLimited && hint.after !== undefined)) throw networkError("network_failed", error);
       if (index === 3) throw networkError("network_retry_exhausted");
       const backoff = Math.min(8000, 500 * 2 ** index) * (0.5 + clock.random() * 0.5);
       const delay = hint.rateLimited ? Math.max(backoff, hint.after!) + clock.random() * 250 : backoff;

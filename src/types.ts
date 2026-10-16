@@ -42,10 +42,12 @@ export interface Transport {
   post(route: Route, text: string, signal?: AbortSignal): Promise<void>;
   readThread(route: Route, cursor?: string, signal?: AbortSignal): Promise<ThreadPage>;
   upload(route: Route, content: Buffer, filename: string, title: string, signal: AbortSignal): Promise<void | {fileId: string}>;
+  verifyUpload?(route: Route, fileId: string, signal: AbortSignal): Promise<boolean>;
   download?(route: Route, fileId: string, signal: AbortSignal): Promise<{bytes: Buffer; filename: string}>;
   list(cursor?: string): Promise<{ conversations: Conversation[]; nextCursor?: string }>;
 }
 export interface Capabilities {
+  deliveryStatus?(operationId?: string): Promise<import("./delivery.ts").DeliveryStatus[]>;
   reply(text: string): Promise<void>;
   readThread(cursor?: string): Promise<ThreadPage>;
   upload(relativePath: string, title?: string): Promise<void | {fileId: string}>;

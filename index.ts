@@ -1,3 +1,4 @@
+import {DeliveryLedger} from "./src/delivery.ts";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { SlackBridge } from "./src/bridge.ts";
 import { readConfig } from "./src/config.ts";
@@ -16,6 +17,7 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
   // Retain the bounded, expiring event ledger across off/on bridge instances.
   // Factory-local only: no cross-factory or persisted session data.
   const eventDedupe = new Map<string, number>();
+  const deliveries = new DeliveryLedger();
   let context: ExtensionContext | undefined;
   let lifecycle = 0;
   let binding: LocalBinding | undefined;
@@ -90,7 +92,7 @@ export default function slackExtension(pi: ExtensionAPI, configuration = async (
             }},
           () => new SlackTransport(config),
           (input, requestCapabilities, signal) => boundNative.run(input, requestCapabilities, signal),
-          undefined, eventDedupe);
+          undefined, eventDedupe, deliveries);
         bridge = candidate;
         lastActivity = undefined;
         const request = new AbortController(); bindingRequest = request;

@@ -140,6 +140,10 @@ export class NativeSession {
     // Calling the resolver without executing a method must not capture stale authority.
     select();
     return {
+      deliveryStatus: operationId => call(record => {
+        if (!record.capabilities.deliveryStatus) throw new Error("Delivery status is unavailable.");
+        return record.capabilities.deliveryStatus(operationId);
+      }),
       reply: text => call(async record => {await record.capabilities.reply(text);record.explicitReply = true;}),
       readThread: cursor => call(record => record.capabilities.readThread(cursor)),
       upload: (file, title) => call(record => record.capabilities.upload(file, title)),

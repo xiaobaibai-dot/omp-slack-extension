@@ -10,6 +10,14 @@ function result(data: unknown) { return {content: [{type: "text" as const, text:
 export function makeSlackTools(z: ExtensionAPI["zod"], source: Capabilities | ((requestId?: string) => Capabilities)): ToolDefinition[] {
   const capabilities = (params: unknown) => typeof source === "function" ? source(stringArgument(params, "request_id", true)) : source;
   return [
+    {name: "slack_delivery_status", label: "Inspect source delivery outcomes", loadMode: "essential", approval: "read",
+      description: "List this source thread's delivery operations, including uncertain uploads and messages. Optional operation_id inspects an upload: before-completion failures are confirmed not shared and may be explicitly attempted anew; completion uncertainty clears only on affirmative Slack source-thread share evidence. Missing files/scopes never prove non-delivery. Does not resend. Requires an active consumed request, including a new request in the same thread. Ledger lasts only this extension factory's lifetime; restart loses history.",
+      parameters: z.object({request_id: z.string().optional(), operation_id: z.string().optional()}),
+      async execute(_id, params) {
+        const caps = capabilities(params);
+        if (!caps.deliveryStatus) throw new Error("Delivery status is unavailable.");
+        return result(await caps.deliveryStatus(stringArgument(params, "operation_id", true)));
+      }},
     {name: "slack_reply", label: "Reply to source Slack thread", loadMode: "essential", approval: "write",
       description: "Send text to a consumed request's original Slack thread. Use request_id from its bridge marker when inputs are mixed; queued or retired IDs are refused. Canonical <@USER_ID> syntax produces a real Slack user mention. After a successful explicit reply, the bridge does not also send your final explanation. An unambiguous final answer is sent automatically; mixed answers are not.",
       parameters: z.object({request_id: z.string().optional(), text: z.string()}),

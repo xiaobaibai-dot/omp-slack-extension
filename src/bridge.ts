@@ -1,3 +1,4 @@
+import {DeliveryLedger} from "./delivery.ts";
 import { parseEvent, readUpload, readHostUpload, requesterAllowed, safeError } from "./security.ts";
 import * as fs from "node:fs/promises";
 import path from "node:path";
@@ -30,12 +31,14 @@ export class SlackBridge {
   #history = new Map<string, HistoryTurn[]>();
   #startedAt = 0;
   #stopping?: Promise<void>;
+  readonly deliveries: DeliveryLedger;
   readonly config: Config;
   readonly host: Host;
   readonly makeTransport: () => Transport;
   readonly run: IsolatedRunner;
   readonly clock: TaskClock;
-  constructor(config: Config, host: Host, makeTransport: () => Transport, run: IsolatedRunner, clock: TaskClock = taskClock, eventDedupe = new Map<string, number>()) {
+  constructor(config: Config, host: Host, makeTransport: () => Transport, run: IsolatedRunner, clock: TaskClock = taskClock, eventDedupe = new Map<string, number>(), deliveries = new DeliveryLedger()) {
+    this.deliveries = deliveries;
     this.config = config; this.host = host; this.makeTransport = makeTransport; this.run = run;
     this.clock = clock;
     this.#dedupe = eventDedupe;
@@ -43,7 +46,7 @@ export class SlackBridge {
   get state(): State { return this.#state; }
   status() {
     const native = this.host.status?.();
-    return {state: this.#state, pending: this.#requests.size, busy: this.#requests.size > 0, historyRoutes: this.#history.size, connection: this.#transport?.connectionStatus?.(), native};
+    return {state: this.#state, pending: this.#requests.size, busy: this.#requests.size > 0, historyRoutes: this.#history.size, connection: this.#transport?.connectionStatus?.(), deliveries: this.deliveries.list(), native};
   }
   async start(): Promise<void> {
     if (this.#state !== "off") return;
@@ -130,8 +133,8 @@ export class SlackBridge {
       if (this.#state !== "on" || generation !== this.#generation) return;
       const status = this.host.status?.(job.route);
       const text = kind === "usage" ? "Use !insert TEXT / !steer TEXT, !queue TEXT, or !status. Ordinary messages use OMP follow-up." :
-        JSON.stringify({state: this.#state, scope: "your source thread only", defaultDelivery: "followUp", connection: transport.connectionStatus?.(), native: status ?? null});
-      await transport.post(job.route, text, controller.signal);
+        JSON.stringify({state: this.#state, scope: "your source thread only", defaultDelivery: "followUp", connection: transport.connectionStatus?.(), deliveries: this.deliveries.summary(job.route), native: status ?? null});
+      await this.#systemPost(transport, job.route, text, controller.signal);
     } catch (error) {
       if (!controller.signal.aborted) this.host.notify(`Slack control reply failed (${safeError(error)}). No automatic retry.`, "warning");
     } finally {this.#controls.delete(controller);}
@@ -155,18 +158,34 @@ export class SlackBridge {
     let explicitlyReplied = false;
     let reads = 0;
     let uploads = 0;
+    let deliveryFailureReason: RequestReason | undefined;
+    let verifications = 0;
     const guard = () => {
       controller.signal.throwIfAborted();
       if (this.#state !== "on" || this.#generation !== generation || this.#requests.get(requestId)?.job !== job) throw new Error("Slack request is no longer active.");
       if (!requesterAllowed(this.config, job.route.user, job.route.channel)) throw new Error("Request sender is no longer authorized.");
     };
     const capabilities: Capabilities = {
+      deliveryStatus: async operationId => {
+        guard();
+        if (operationId) {
+          if (++verifications > 3) throw new Error("Delivery verification limit exceeded (3 per request).");
+          await this.deliveries.verify(job.route, operationId,
+            transport.verifyUpload ? fileId => transport.verifyUpload!(job.route, fileId, controller.signal) : undefined);
+        }
+        guard();return this.deliveries.list(job.route);
+      },
       reply: async text => {
         guard();
         if (!text.trim() || text.length > 6000 || replies >= 3) throw new Error("Reply bound exceeded (3 replies, 6000 characters each).");
-        ++replies;
-        try {await transport.post(job.route, text, controller.signal);}
-        catch (error) {if (failureReason(error) === "network_outcome_uncertain") controller.abort(error);throw error;}
+        const {entry, duplicate} = this.deliveries.begin(job.route, "message", text.trim());
+        if (!duplicate) {
+          ++replies;
+          try {await transport.post(job.route, text, controller.signal);entry.state = "delivered";}
+          catch (error) {this.deliveries.fail(entry, error);deliveryFailureReason = failureReason(error);
+            this.host.notify(`Slack delivery ${entry.operationId}: ${entry.state}. Source read tools remain available; no automatic final or resend.`, "warning");
+            throw Object.assign(this.deliveries.blocked(entry), {code: failureReason(error)});}
+        }
         explicitlyReplied = true;
         guard();
         lastReply = text.trim();
@@ -181,14 +200,24 @@ export class SlackBridge {
       },
       upload: async (relativePath, title) => {
         guard();
-        if (++uploads > 3) throw new Error("Upload limit exceeded (3 files per request).");
         const file = this.config.uploadMode === "host" ? await readHostUpload(this.config.cwd ?? process.cwd(), relativePath) : await readUpload(this.config.uploadRoot, relativePath);
         guard();
-        let uploaded: void | {fileId: string};
-        try {uploaded = await transport.upload(job.route, file.bytes, file.filename, (title ?? file.filename).slice(0, 200), controller.signal);}
-        catch (error) {if (failureReason(error) === "network_outcome_uncertain") controller.abort(error);throw error;}
-        guard();
-        return uploaded;
+        // Recheck after asynchronous file reading so concurrent tools cannot exceed the bound.
+        if (uploads >= 3) throw new Error("Upload limit exceeded (3 files per request).");
+        const {entry, duplicate} = this.deliveries.begin(job.route, "upload", file.bytes);
+        if (duplicate) return entry.fileId ? {fileId: entry.fileId} : undefined;
+        ++uploads;
+        try {
+          const uploaded = await transport.upload(job.route, file.bytes, file.filename, (title ?? file.filename).slice(0, 200), controller.signal);
+          entry.state = "delivered";entry.fileId = uploaded?.fileId;
+          guard();return uploaded;
+        } catch (error) {
+          // An off/scope guard after confirmed completion must not undo delivery evidence.
+          if (entry.state !== "delivered") this.deliveries.fail(entry, error);
+          deliveryFailureReason = failureReason(error);
+          this.host.notify(`Slack upload ${entry.operationId}: ${entry.state}${entry.phase ? ` at ${entry.phase}` : ""}${entry.fileId ? ` (${entry.fileId})` : ""}. Inspect slack_delivery_status; no automatic final or resend.`, "warning");
+          throw Object.assign(this.deliveries.blocked(entry), {code: failureReason(error)});
+        }
       },
       // A remote model may only discover its own authorized conversation.
       download: async (fileId, targetPath) => {
@@ -218,11 +247,12 @@ export class SlackBridge {
       const rawReply = (await this.run({job, history, requestId}, capabilities, controller.signal)).trim();
       const reply = rawReply.length > 6000 ? rawReply.slice(0, 5890) + "\n[Truncated at 6000 characters. Ask for a shorter answer or an explicitly requested output file.]" : rawReply;
       guard();
-      if (reply && !explicitlyReplied) {
-        await transport.post(job.route, reply.slice(0, 6000), controller.signal);
+      if (reply && !explicitlyReplied && !deliveryFailureReason && !this.deliveries.suppressFinal(job.route)) {
+        await capabilities.reply(reply.slice(0, 6000));
       }
+      if (deliveryFailureReason || this.deliveries.suppressFinal(job.route)) reason = deliveryFailureReason ?? "network_outcome_uncertain";
       guard();
-      const deliveredReply = explicitlyReplied ? lastReply : reply;
+      const deliveredReply = explicitlyReplied ? lastReply : "";
       if (deliveredReply) {
         const turns = [...history, {request: job.text.slice(0, 6000), reply: deliveredReply.slice(0, 6000)}].slice(-6);
         while (JSON.stringify(turns).length > 32_000) turns.shift();
@@ -242,6 +272,12 @@ export class SlackBridge {
       if (this.#requests.get(requestId)?.job === job) this.#requests.delete(requestId);
     }
   }
+  async #systemPost(transport: Transport, route: Route, text: string, signal: AbortSignal): Promise<void> {
+    const {entry, duplicate} = this.deliveries.begin(route, "message", text.trim(), false);
+    if (duplicate) return;
+    try {await transport.post(route, text, signal);entry.state = "delivered";}
+    catch (error) {this.deliveries.fail(entry, error);throw error;}
+  }
   async providerNotice(route: Route, notice: ProviderNotice): Promise<boolean> {
     // Internal system notification only; never an agent tool, prompt or task retry.
     const transport = this.#transport, generation = this.#generation;
@@ -250,7 +286,7 @@ export class SlackBridge {
     const controller = new AbortController();this.#controls.add(controller);
     try {
       if (generation !== this.#generation || this.#state !== "on") return false;
-      await transport.post(route, notice.text, controller.signal);
+      await this.#systemPost(transport, route, notice.text, controller.signal);
       return generation === this.#generation && this.#state === "on" && !controller.signal.aborted;
     } catch (error) {
       if (!controller.signal.aborted) this.host.notify(`Slack model notice could not be confirmed (${safeError(error)}). No automatic resend.`, "warning");

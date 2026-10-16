@@ -43,11 +43,12 @@ test("request logs exclude text, replies, errors and tokens; unknown failures re
   assert.deepEqual(Object.keys(h.logs[1]!).sort(), ["phase", "eventId", "requestId", "teamId", "channelId", "threadId", "messageTs", "startedAt", "endedAt", "reason"].sort());
   await b.stop();
 });
-test("uncertain explicit delivery cancels the source turn and blocks further sends and automatic final", async () => {
+test("uncertain explicit delivery preserves source reads and blocks further sends and automatic final", async () => {
   const h = host(), t = new FakeTransport();let calls = 0;
   t.post = async () => {calls++;throw requestError("network_outcome_uncertain");};
   const b = new SlackBridge(config(), h, () => t, async (_i, caps, signal) => {
-    await assert.rejects(caps.reply("body"));assert.equal(signal.aborted, true);
+    await assert.rejects(caps.reply("body"));assert.equal(signal.aborted, false);
+    await caps.readThread();
     await assert.rejects(caps.reply("body again"));return "try another final";
   });
   await b.start();b.accept(envelope("EvUncertain"));await settle();
@@ -68,7 +69,7 @@ test("unclassified mutation response failures stop bridge duplicate replies and 
     }, {kind:"mutation",signal:new AbortController().signal,clock});
     const b = new SlackBridge(config(),h,()=>t,async (_i,caps,signal) => {
       await assert.rejects(caps.reply("requested body"),{code:"network_outcome_uncertain"});
-      assert.equal(signal.aborted,true);await assert.rejects(caps.reply("requested body again"));return "automatic fallback";
+      assert.equal(signal.aborted,false);await caps.readThread();await assert.rejects(caps.reply("requested body again"));return "automatic fallback";
     },clock);
     await b.start();b.accept(envelope("EvAmbiguous"));await settle();
     assert.equal(calls,1);assert.deepEqual(t.posts.map(post=>post.text),["requested body"]);

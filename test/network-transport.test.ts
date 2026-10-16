@@ -75,3 +75,21 @@ fixtureTest("real WebClient request interceptor physically aborts its Axios adap
   const pending = transport.list();void pending.catch(() => {});await settle();assert.equal(calls, 1);
   await transport.stop();await assert.rejects(pending);assert.equal(adapterSignal?.aborted, true);assert.equal(calls, 1);
 });
+fixtureTest("file verification accepts only affirmative matching source-thread share; missing evidence remains unknown", async t => {
+  let response:any={ok:true,file:{id:"FZIP",shares:{public:{C111:[{thread_ts:job().route.thread}]}}}};
+  setup(t,async(method,args)=>{assert.equal(method,"files.info");assert.deepEqual(args,{file:"FZIP"});return response;});
+  const transport=new SlackTransport(config(),new FakeClock());await transport.start(()=>{});
+  try {
+    assert.equal(await transport.verifyUpload(job().route,"FZIP",new AbortController().signal),true);
+    for(const file of [undefined,{id:"FZIP"},{id:"FOTHER",shares:{public:{C111:[{thread_ts:job().route.thread}]}}},
+      {id:"FZIP",shares:{public:{COTHER:[{thread_ts:job().route.thread}]}}}, {id:"FZIP",shares:{public:{C111:[{thread_ts:"different"}]}}}]) {
+      response={ok:true,file};assert.equal(await transport.verifyUpload(job().route,"FZIP",new AbortController().signal),false);
+    }
+  }finally{await transport.stop();}
+});
+fixtureTest("file verification missing scope is a read failure and cannot be treated as absence",async t=>{
+  setup(t,async()=>{throw {code:"slack_webapi_platform_error",data:{error:"missing_scope"}};});
+  const transport=new SlackTransport(config(),new FakeClock());await transport.start(()=>{});
+  try {await assert.rejects(transport.verifyUpload(job().route,"FZIP",new AbortController().signal),{code:"network_failed",diagnostic:{category:"network_failed",code:"missing_scope"}});}
+  finally{await transport.stop();}
+});

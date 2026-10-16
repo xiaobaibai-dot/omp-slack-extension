@@ -44,8 +44,8 @@ async function fixture(name:string,handler:any,options:{effect?:Function,maxQueu
   const registry=new ModelRegistry(auth,path.join(root,'models.yml'),{settings,ignoreLocalModelConfig:true,cacheDbPath:':memory:',fetch:globalThis.fetch});
   const mock=createMockModel({id:`mock-${name}`,handler});registerMockApi();
   const jobs=new AsyncJobManager({onJobComplete:async()=>{},retentionMs:0});
-  const config={appToken:'xapp-FAKE',botToken:'xoxb-FAKE',teamId:'T123',appId:'A123',owners:new Set(['UOWNER']),channels:new Set(['C111','G222','D333']),channelAllUsers:new Set(['C111']),localTools:[],maxQueue:options.maxQueue??32};
-  const names=['wait','slack_reply','slack_read_thread','slack_upload_file','slack_download_file','slack_list_conversations',...(options.effect?['fixture_effect']:[])];
+  const config={appToken:'xapp-FAKE',botToken:'xoxb-FAKE',teamId:'T123',appId:'A123',owners:new Set(['UOWNER']),channels:new Set(['C111','G222','D333']),channelAllUsers:new Set(['C111']),localTools:[],uploadMode:'host' as const,maxQueue:options.maxQueue??32};
+  const names=['wait','slack_delivery_status','slack_reply','slack_read_thread','slack_upload_file','slack_download_file','slack_list_conversations',...(options.effect?['fixture_effect']:[])];
   const {session}=await createAgentSession({cwd:root,agentDir:path.resolve('agent'),model:mock,modelRegistry:registry,settings,sessionManager:SessionManager.inMemory(root),agentRegistry:AgentRegistry.global(),bindProcessState:false,
     systemPrompt:['Credential-free integration fixture; follow the supplied mock responses.'],restrictToolNames:false,toolNames:names,
     disableExtensionDiscovery:true,extensions:[pi=>{slackExtension(pi,async()=>config);if(options.beforeAgentStart)pi.on('before_agent_start',options.beforeAgentStart);if(options.effect)pi.registerTool({name:'fixture_effect',label:'Local bounded effect fixture',description:'Append synthetic heartbeat records to an isolated test file.',parameters:pi.zod.object({}),loadMode:'essential',approval:'write',execute:(_id,args,signal)=>options.effect!(signal,root)});}],
@@ -263,4 +263,56 @@ test('off during actual transport backoff cancels reconnect and preserves the ru
       f.evidence.socketFaults={starts:faults.starts(),httpCalls:[...faults.httpCalls],posts:f.posts.length};
     }finally{await done.promise;await f.close();}
   });
+},20000);
+
+// Real AgentSession and extension tools; only Slack network boundaries are replaced.
+test('real native delivery uncertainty preserves sidecar, reads and explicit text; new request cannot duplicate uncertain ZIP',async()=>{
+  const originalUpload=SlackTransport.prototype.upload,originalRead=SlackTransport.prototype.readThread;
+  const uploads:string[]=[],reads:string[]=[],requestIds:string[]=[];let stage=0;
+  SlackTransport.prototype.upload=async function(route,bytes,name,title,signal){signal.throwIfAborted();uploads.push(name);
+    if(name==='zip')throw Object.assign(new Error('synthetic completion lost response'),{code:'network_outcome_uncertain',phase:'complete',fileId:'FZIP'});
+    return {fileId:'FSIDE'};
+  };
+  SlackTransport.prototype.readThread=async function(route){reads.push(route.thread);return {messages:[],truncated:false};};
+  const f=await fixture('delivery-isolation',context=>{
+    const r=requestOf(context)!;if(!requestIds.includes(r.id))requestIds.push(r.id);
+    const args={request_id:r.id};stage++;
+    if(stage===1||stage===8)return tool('slack_upload_file',{...args,relative_path:'zip'});
+    if(stage===2)return tool('slack_upload_file',{...args,relative_path:'sidecar'});
+    if(stage===3||stage===7)return tool('slack_read_thread',args);
+    if(stage===4)return tool('slack_delivery_status',args);
+    if(stage===5)return tool('slack_reply',{...args,text:'ZIP uncertain; sidecar confirmed.'});
+    return response('Do not broadcast this automatic final.');
+  });
+  try {
+    await fs.writeFile(path.join(f.root,'zip'),'zip bytes');await fs.writeFile(path.join(f.root,'sidecar'),'hash bytes');
+    f.send('Upload ZIP and sidecar','C111','1700000000.015001');await f.session.waitForIdle();await until(()=>stage===6,'six first-request model turns');
+    assert.deepEqual(uploads,['zip','sidecar']);assert.equal(reads.length,1);assert.equal(f.posts.length,1);assert.equal(f.posts[0].text,'ZIP uncertain; sidecar confirmed.');
+    const status=f.events.find(e=>e.type==='tool_execution_end'&&e.name==='slack_delivery_status');
+    assert.match(JSON.stringify(status.result),/FZIP/);assert.match(JSON.stringify(status.result),/uncertain/);
+    f.send('Inspect existing delivery; do not duplicate','C111','1700000000.015001');await f.session.waitForIdle();await until(()=>stage===9,'three second-request model turns');
+    assert.equal(requestIds.length,2);assert.notEqual(requestIds[0],requestIds[1]);assert.deepEqual(uploads,['zip','sidecar']);assert.equal(reads.length,2);assert.equal(f.posts.length,1);
+    assert.equal(f.aborts,0);assert.equal(f.errors.length,0);
+    await f.command('status');assert.match(f.notices.findLast(n=>n.startsWith('{"state"'))!,/"state":"uncertain"/);
+  }finally{await f.close();SlackTransport.prototype.upload=originalUpload;SlackTransport.prototype.readThread=originalRead;}
+},20000);
+
+test('real native pre-completion failure requires status inspection then permits one explicit fresh upload',async()=>{
+  const originalUpload=SlackTransport.prototype.upload;let uploads=0,stage=0,operationId:string|undefined;
+  SlackTransport.prototype.upload=async function(){if(++uploads===1)throw Object.assign(new Error('synthetic transfer loss'),{code:'network_outcome_uncertain',phase:'transfer',fileId:'FSTAGED'});return {fileId:'FRECOVERED'};};
+  const f=await fixture('delivery-precomplete',context=>{
+    const r=requestOf(context)!;stage++;
+    if(stage===1||stage===4)return tool('slack_upload_file',{request_id:r.id,relative_path:'zip'});
+    if(stage===2)return tool('slack_delivery_status',{request_id:r.id});
+    if(stage===3){const result=[...context.messages].reverse().find((m:any)=>m.role==='toolResult');operationId=JSON.parse(textOf(result))[0].operationId;
+      return tool('slack_delivery_status',{request_id:r.id,operation_id:operationId});}
+    if(stage===5)return tool('slack_reply',{request_id:r.id,text:'Fresh upload confirmed.'});
+    return response('Do not broadcast duplicate final.');
+  });
+  try {
+    await fs.writeFile(path.join(f.root,'zip'),'fresh bytes');f.send('Upload ZIP','C111','1700000000.016001');await f.session.waitForIdle();await until(()=>stage===6,'recovered explicit upload');
+    assert.ok(operationId);assert.equal(uploads,2);assert.equal(f.posts.length,1);assert.equal(f.posts[0].text,'Fresh upload confirmed.');assert.equal(f.aborts,0);assert.equal(f.errors.length,0);
+    const results=f.events.filter(e=>e.type==='tool_execution_end'&&e.name==='slack_delivery_status').map(e=>JSON.stringify(e.result));
+    assert.match(results[0],/not_shared/);assert.match(results[1],/rejected/);
+  }finally{await f.close();SlackTransport.prototype.upload=originalUpload;}
 },20000);

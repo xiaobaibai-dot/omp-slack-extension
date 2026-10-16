@@ -199,6 +199,17 @@ export class SlackTransport implements Transport {
       }, {signal: uploadSignal, kind: "mutation", timeoutMs: 30_000, clock: this.clock});
     }, route, content, filename, title, signal, () => this.#check());
   }
+  async verifyUpload(route: Route, fileId: string, signal: AbortSignal): Promise<boolean> {
+    this.#check();
+    if (!/^F[A-Z0-9]+$/.test(fileId)) throw new Error("Invalid delivery file identifier.");
+    const result = await this.#api(web => web.files.info({file: fileId}), "read", signal);
+    this.#check();
+    // Absence, processing, missing scope, and other-thread/channel shares are never proof of non-delivery.
+    const file = result.file;
+    if (!result.ok || file?.id !== fileId) return false;
+    return [file.shares?.public, file.shares?.private].some(shares =>
+      shares?.[route.channel]?.some(share => share.thread_ts === route.thread));
+  }
   async list(cursor?: string) {
     this.#check();
     const page = await this.#api(web => {this.#check();return web.users.conversations({types: "public_channel,private_channel,im", exclude_archived: true, limit: 100, cursor});}, "read");

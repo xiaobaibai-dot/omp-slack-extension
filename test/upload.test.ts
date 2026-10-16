@@ -23,3 +23,8 @@ test("cancellation during binary upload prevents later share even when listener 
 test("untrusted upload destination is refused without transmitting bytes",async()=>{
   let puts=0;await assert.rejects(phasedUpload({getURL:async()=>({...target,upload_url:"https://evil.example/upload"}),complete:async()=>{}},async()=>{puts++;},job().route,Buffer.from("secret"),"a","a",new AbortController().signal,()=>{}));assert.equal(puts,0);
 });
+test("confirmed completion receipt survives local cancellation and a revoked guard",async()=>{
+  const controller=new AbortController();let revoked=false,shares=0;
+  const result=await phasedUpload({getURL:async()=>target,complete:async()=>{shares++;revoked=true;controller.abort();}},async()=>{},job().route,Buffer.from("x"),"a","a",controller.signal,()=>{if(revoked)throw new Error("off");});
+  assert.deepEqual(result,{fileId:"F123"});assert.equal(shares,1);assert.equal(controller.signal.aborted,true);
+});
